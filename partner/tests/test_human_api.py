@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from partner_agent import human_api
@@ -17,6 +18,23 @@ async def _always_relevant(**kwargs) -> bool:
 
 async def _passthrough_postprocess(**kwargs) -> str:
     return kwargs["partner_response"]
+
+
+@pytest.fixture(autouse=True)
+def _mock_leader_complete(monkeypatch):
+    async def _fake_complete(**kwargs):
+        return {
+            "final_state": "completed",
+            "task_id": kwargs["task_id"],
+            "partner_sender_id": "partner-a",
+            "binding_ok": True,
+            "product_texts": [],
+            "status_texts": [],
+            "trace": [{"step": "complete"}],
+            "call_proof": {"invoked": True, "trace_steps": ["complete"]},
+        }
+
+    monkeypatch.setattr(human_api, "leader_complete_task", _fake_complete)
 
 
 def test_human_chat_page_available() -> None:
@@ -109,8 +127,8 @@ def test_human_chat_with_rpc_url_calls_leader(monkeypatch) -> None:
     assert data["mode"] == "leader-proxy"
     assert data["answer"] == "远端回复"
     assert data["collaboration"]["effectiveRpcUrl"] == "http://127.0.0.1:5000/rpc"
-    assert data["collaboration"]["taskId"] == "task-1"
-    assert data["collaboration"]["state"] == "awaiting-completion"
+    assert data["collaboration"]["taskId"] == ""
+    assert data["collaboration"]["state"] == "completed"
 
 
 def test_human_chat_auto_extract_rpc_url_and_sticky(monkeypatch) -> None:

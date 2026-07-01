@@ -1,7 +1,7 @@
 {
   "aic": "pending-assignment",
   "active": true,
-  "lastModifiedTime": "2026-07-01T09:30:00+08:00",
+  "lastModifiedTime": "2026-07-01T20:22:00+08:00",
   "protocolVersion": "02.01",
   "name": "文本咨询伙伴智能体",
   "description": "实体 Partner 智能体。能力范围：面向通用文本聊天咨询，支持文本输入并返回文本结果。明确不支持图像、语音等非文本输入；收到非文本请求时将拒绝或要求改为文本输入。",
@@ -9,24 +9,15 @@
   "provider": {
     "organization": "北京科技大学",
     "department": "",
-    "url": "https://113.47.5.136",
+    "url": "http://113.47.5.136",
     "license": ""
   },
-  "securitySchemes": {
-    "mtls": {
-      "type": "mutualTLS",
-      "description": "智能体间 mTLS 双向认证"
-    }
-  },
+  "securitySchemes": {},
   "endPoints": [
     {
-      "url": "https://113.47.5.136/rpc",
+      "url": "http://113.47.5.136/rpc",
       "transport": "JSONRPC",
-      "security": [
-        {
-          "mtls": []
-        }
-      ]
+      "security": []
     }
   ],
   "capabilities": {

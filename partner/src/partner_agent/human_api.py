@@ -34,6 +34,18 @@ _RPC_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 TERMINAL_STATES = {"completed", "failed", "rejected", "canceled"}
 ACTIVE_STATES = {"accepted", "working", "awaiting-input", "awaiting-completion"}
 ALL_STATES = TERMINAL_STATES | ACTIVE_STATES
+FOLLOWUP_HINTS = (
+    "继续",
+    "补充",
+    "细化",
+    "展开",
+    "完善",
+    "基于刚才",
+    "沿着刚才",
+    "接着上个",
+)
+COMPLETE_HINTS = ("完成", "确认", "就这样", "结束", "提交")
+MIN_RETRY_BUDGET_SECONDS = 5.0
 
 
 def _extract_rpc_url(text: str) -> str:
@@ -62,6 +74,48 @@ def _resolve_answer_from_leader(result: dict[str, object]) -> str:
 
 def _normalize_state(state: str) -> str:
     return state.strip().lower().replace("_", "-")
+
+
+def _exception_text(exc: Exception) -> str:
+    text = str(exc).strip()
+    if text:
+        return text
+    return exc.__class__.__name__
+
+
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    for token in keywords:
+        if token.lower() in lowered:
+            return True
+    return False
+
+
+def _is_followup_intent(text: str) -> bool:
+    return _contains_any(text, FOLLOWUP_HINTS)
+
+
+def _is_complete_intent(text: str) -> bool:
+    return _contains_any(text, COMPLETE_HINTS)
+
+
+def _resolve_action_for_awaiting_completion(
+    *,
+    state: SessionRuntimeState,
+    action: str,
+    text: str,
+) -> tuple[str, bool]:
+    normalized_state = _normalize_state(state.last_state)
+    if normalized_state != "awaiting-completion" or not state.active_task_id:
+        return action, False
+    if action == "call_complete" or _is_complete_intent(text):
+        return "call_complete", False
+    if action == "call_continue" and _is_followup_intent(text):
+        return action, False
+    # For a new topic, force a new task instead of reusing stale awaiting-completion task.
+    return "call_start", True
 
 
 def _session_valid_for_active_task(state: SessionRuntimeState) -> bool:
@@ -570,6 +624,10 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
     )
     timings_ms["routing"] = int((perf_counter() - start_router) * 1000)
     action = decision.get("action", "local_reply")
+    action, reset_stale_task = _resolve_action_for_awaiting_completion(state=state, action=action, text=text)
+    if reset_stale_task:
+        state.active_task_id = ""
+        state.last_state = ""
     received_at = datetime.now().isoformat()
 
     if action == "local_reply":
@@ -715,6 +773,45 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                     task_id=task_id,
                     timeout_seconds=call_timeout,
                 )
+
+        # Completion gate (demo-leader inspired): for one-shot collaboration we close
+        # awaiting-completion tasks immediately unless user explicitly asks to keep pending.
+        final_state = _normalize_state(str(leader_result.get("final_state", "")))
+        initial_proof = leader_result.get("call_proof") or _call_proof_for_failure(
+            state=state,
+            reason="pre-complete-missing-proof",
+        )
+        if (
+            final_state == "awaiting-completion"
+            and action != "call_complete"
+            and _proof_allows_remote_claim(initial_proof)
+        ):
+            remaining_before_complete = _remaining_budget(start_total)
+            if remaining_before_complete > 1.0:
+                complete_timeout = min(LEADER_CALL_TIMEOUT_SECONDS, remaining_before_complete)
+                complete_start = perf_counter()
+                complete_task_id = str(leader_result.get("task_id", "")).strip()
+                if complete_task_id:
+                    complete_result = await leader_complete_task(
+                        partner_rpc_url=rpc_url,
+                        leader_id=LEADER_AIC,
+                        session_id=state.aip_session_id,
+                        task_id=complete_task_id,
+                        timeout_seconds=complete_timeout,
+                    )
+                    combined_trace = [
+                        *(leader_result.get("trace", []) or []),
+                        *(complete_result.get("trace", []) or []),
+                    ]
+                    if not complete_result.get("product_texts"):
+                        complete_result["product_texts"] = leader_result.get("product_texts", [])
+                    if not complete_result.get("status_texts"):
+                        complete_result["status_texts"] = leader_result.get("status_texts", [])
+                    if not complete_result.get("call_proof"):
+                        complete_result["call_proof"] = leader_result.get("call_proof", {})
+                    complete_result["trace"] = combined_trace
+                    leader_result = complete_result
+                    timings_ms["leader_complete"] = int((perf_counter() - complete_start) * 1000)
     except Exception as exc:
         timings_ms["leader"] = int((perf_counter() - start_leader) * 1000)
         state = _rebuild_session_state(state)
@@ -727,7 +824,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
             answer="远端协作调用失败，请稍后重试。",
             memory_turns=MEMORY.size(chat_key),
             recovery_hint=hint,
-            error=str(exc),
+            error=_exception_text(exc),
             phase=phase,
             timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
         )
@@ -777,7 +874,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
     if not relevant:
         retry_query = f"请只回答这个问题，不要复述旧主题：{text}"
         remaining_retry = _remaining_budget(start_total)
-        if remaining_retry <= 2.0:
+        if remaining_retry <= MIN_RETRY_BUDGET_SECONDS:
             state = _rebuild_session_state(state)
             SESSION_STATES.save(state)
             return _leader_error_response(
@@ -809,7 +906,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                 answer="离题恢复重试失败，已停止当前协作。",
                 memory_turns=MEMORY.size(chat_key),
                 recovery_hint="请稍后重试或更换远端地址。",
-                error=str(exc),
+                error=_exception_text(exc),
                 phase="offtopic-recovery",
                 timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
             )
