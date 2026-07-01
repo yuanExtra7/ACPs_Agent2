@@ -1,4 +1,8 @@
 note/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 partner/.venv/
 partner/__pycache__/
 partner/.pytest_cache/
