@@ -1,0 +1,9 @@
+note/
+partner/.venv/
+partner/__pycache__/
+partner/.pytest_cache/
+partner/.mypy_cache/
+partner/.env
+partner/.env.*
+partner/atr/.acps-cli/
+partner/atr/certs/

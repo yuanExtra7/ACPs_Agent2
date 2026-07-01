@@ -1,0 +1,15 @@
+[registry]
+base_url = "https://ioa.pub/registry"
+# TODO: 目前仅用于 entity derive 等 mTLS 场景，先与 base_url 保持同域占位。
+mtls_base_url = "https://ioa.pub/registry"
+
+[auth]
+user_token_file = "./.acps-cli/tokens/registry-user.json"
+admin_token_file = "./.acps-cli/tokens/registry-admin.json"
+
+[ca]
+base_url = "https://ioa.pub/ca-server"
+
+[discovery]
+base_url = "https://ioa.pub/discovery"
+

@@ -1,0 +1,31 @@
+"""FastAPI app exposing ACPs AIP RPC endpoint."""
+
+from __future__ import annotations
+
+from acps_sdk.aip.aip_rpc_server import (
+    CommandHandlers,
+    DefaultHandlers,
+    add_aip_rpc_router,
+)
+from fastapi import FastAPI
+
+from .handlers import on_continue, on_start
+from .settings import APP_TITLE, PARTNER_AIC, RPC_PATH
+
+app = FastAPI(title=APP_TITLE)
+
+handlers = CommandHandlers(
+    on_start=on_start,
+    on_get=DefaultHandlers.get,
+    on_cancel=DefaultHandlers.cancel,
+    on_complete=DefaultHandlers.complete,
+    on_continue=on_continue,
+)
+
+add_aip_rpc_router(app, RPC_PATH, handlers)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok", "aic": PARTNER_AIC}
+

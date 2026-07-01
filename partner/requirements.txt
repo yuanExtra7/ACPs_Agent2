@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+aio-pika
+httpx
+-e ../../ACPs-community/acps-sdk

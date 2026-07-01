@@ -1,0 +1,121 @@
+{
+  "aic": "pending-assignment",
+  "active": true,
+  "lastModifiedTime": "2026-07-01T09:30:00+08:00",
+  "protocolVersion": "02.01",
+  "name": "文本咨询伙伴智能体",
+  "description": "实体 Partner 智能体。能力范围：面向通用文本聊天咨询，支持文本输入并返回文本结果。明确不支持图像、语音等非文本输入；收到非文本请求时将拒绝或要求改为文本输入。",
+  "version": "0.1.0",
+  "provider": {
+    "organization": "北京科技大学",
+    "department": "",
+    "url": "https://113.47.5.136",
+    "license": ""
+  },
+  "securitySchemes": {
+    "mtls": {
+      "type": "mutualTLS",
+      "description": "智能体间 mTLS 双向认证"
+    }
+  },
+  "endPoints": [
+    {
+      "url": "https://113.47.5.136/rpc",
+      "transport": "JSONRPC",
+      "security": [
+        {
+          "mtls": []
+        }
+      ]
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "notification": false,
+    "messageQueue": []
+  },
+  "defaultInputModes": [
+    "text/plain"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "skills": [
+    {
+      "id": "ustb.chat.general-consulting",
+      "name": "通用文本咨询",
+      "description": "处理通用文本问答与咨询请求，输出结构化或纯文本回复。",
+      "version": "0.1.0",
+      "tags": [
+        "chat",
+        "text",
+        "consulting",
+        "qa"
+      ],
+      "examples": [
+        "请解释一下什么是向量数据库",
+        "帮我整理一个学习计划，分三周进行",
+        "把这段技术说明总结成三点"
+      ],
+      "inputModes": [
+        "text/plain"
+      ],
+      "outputModes": [
+        "text/plain",
+        "application/json"
+      ]
+    },
+    {
+      "id": "ustb.chat.requirement-clarification",
+      "name": "需求澄清与追问",
+      "description": "在信息不完整时通过文本追问补全约束，进入 awaiting-input 并等待补充。",
+      "version": "0.1.0",
+      "tags": [
+        "clarification",
+        "requirement",
+        "interactive"
+      ],
+      "examples": [
+        "我想做个系统，帮我规划一下",
+        "我需要优化流程，但是还没想好目标",
+        "给我一个方案，越快越好"
+      ],
+      "inputModes": [
+        "text/plain"
+      ],
+      "outputModes": [
+        "text/plain"
+      ]
+    },
+    {
+      "id": "ustb.chat.text-refinement",
+      "name": "文本改写与润色",
+      "description": "对用户提供的文本进行改写、润色、压缩和风格调整，仅处理文本内容。",
+      "version": "0.1.0",
+      "tags": [
+        "rewrite",
+        "polish",
+        "summarization"
+      ],
+      "examples": [
+        "把这段邮件改成更礼貌的语气",
+        "将这段说明压缩为 100 字以内",
+        "把下面内容改写成面向学生的表达"
+      ],
+      "inputModes": [
+        "text/plain"
+      ],
+      "outputModes": [
+        "text/plain"
+      ]
+    }
+  ],
+  "certificate": {
+    "altNames": {
+      "ip": [
+        "113.47.5.136"
+      ]
+    }
+  }
+}
