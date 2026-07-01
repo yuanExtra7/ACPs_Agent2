@@ -20,19 +20,33 @@ class DeepSeekChatBrain:
     def enabled(self) -> bool:
         return bool(self._base_url and self._api_key and self._model)
 
-    async def chat(self, user_text: str) -> str:
+    async def chat(
+        self,
+        user_text: str,
+        history: list[dict[str, str]] | None = None,
+        system_prompt: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
         if not self.enabled:
             raise RuntimeError("DeepSeek brain is not configured")
 
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": system_prompt
+                or "你是一个文本咨询智能体，仅输出简洁清晰的中文文本回答。",
+            }
+        ]
+        for message in history or []:
+            role = message.get("role", "")
+            content = (message.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user_text})
+
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是一个文本咨询智能体，仅输出简洁清晰的中文文本回答。",
-                },
-                {"role": "user", "content": user_text},
-            ],
+            "messages": messages,
             "temperature": 0.3,
             "stream": False,
         }
@@ -42,7 +56,8 @@ class DeepSeekChatBrain:
         }
         url = f"{self._base_url}/chat/completions"
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        timeout = timeout_seconds if timeout_seconds is not None else self._timeout
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()

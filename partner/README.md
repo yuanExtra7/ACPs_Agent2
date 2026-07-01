@@ -1,17 +1,30 @@
 # Partner Agent
 
-最小可运行的 ACPs Partner 实现（Direct RPC 模式）。
+最小可运行的 ACPs `Leader + Partner` 双能力实现（Direct RPC 模式）。
 
 ## 目录结构
 
-- `src/partner_agent/`：应用源码
+- `src/partner_agent/`：应用源码（同时包含 partner 与 leader）
 - `tests/`：测试代码（后续阶段补充）
 
-## 本阶段能力
+## 本阶段能力（双能力）
 
-- 提供 `/rpc` AIP JSON-RPC 端点
-- 支持 `start/get/continue/complete/cancel`
-- 仅支持文本输入输出（`TextDataItem`）
+- **Partner 能力**
+  - 提供 `/rpc` AIP JSON-RPC 端点
+  - 支持 `start/get/continue/complete/cancel`
+  - 仅支持文本输入输出（`TextDataItem`）
+- **Leader 能力**
+  - 提供 `/leader/chat` HTTP 接口，由本服务主动调用目标 Partner 的 AIP RPC
+  - 自动执行 `start -> (poll) -> continue(如需要) -> complete(可选)`
+  - 返回最终状态、文本产物和完整 trace
+- **用户直连页面**
+  - 提供 `/human` 可视化聊天页面（简约商务风、微信式消息布局）
+  - 提供 `/human/chat` 文本对话 API（供页面调用或第三方前端接入）
+- **统一记忆机制（进程内）**
+  - Human：基于 `session_id` 维持会话记忆
+  - Partner：基于 AIP `sessionId/taskId` 维持会话记忆
+  - Leader：基于 `conversation_id` 维持对目标 Partner 的会话记忆
+  - 说明：当前为内存存储，服务重启后清空
 
 ## 启动方式
 
@@ -45,12 +58,56 @@ $env:DEEPSEEK_MODEL="deepseek-chat"
 
 ```bash
 GET /health
+GET /leader/health
+```
+
+用户页面访问：
+
+```bash
+GET /human
+```
+
+用户聊天 API 示例：
+
+```bash
+POST /human/chat
+{
+  "text": "请帮我总结这段需求文档的重点。",
+  "session_id": "human-session-001",
+  "rpc_url": "http://127.0.0.1:5000/rpc"
+}
+
+说明：
+- 不传 `rpc_url`：走本地 Human 对话链路；
+- 传 `rpc_url`：走 Leader 代理调用远端 Partner，返回真实远端结果。
+```
+
+Leader 调用示例（本机调用远端 Partner）：
+
+```bash
+POST /leader/chat
+{
+  "partner_rpc_url": "http://113.47.5.136:5000/rpc",
+  "user_input": "请介绍一下你的能力边界",
+  "continue_input": "请再补充一个示例场景",
+  "leader_id": "edu.ustb.agent.leader.chat.v1",
+  "conversation_id": "leader-session-001"
+}
+```
+
+默认会自动 `complete`，如需只观察到 `awaiting-completion`，可传：
+
+```json
+{
+  "auto_complete": false
+}
 ```
 
 ## 运行本地校验脚本
 
 ```bash
 python scripts/verify_handlers.py
+pytest -q
 ```
 
 ## ATR 文件与脚本

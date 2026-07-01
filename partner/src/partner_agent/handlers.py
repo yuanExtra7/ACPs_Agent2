@@ -5,7 +5,7 @@ from __future__ import annotations
 from acps_sdk.aip.aip_base_model import Product, TaskCommand, TaskResult, TaskState, TextDataItem
 from acps_sdk.aip.aip_rpc_server import TaskManager
 
-from .brain import DeepSeekChatBrain
+from .chat_service import build_chat_answer
 from .settings import PARTNER_AIC
 
 TERMINAL_STATES = {
@@ -18,9 +18,6 @@ CONTINUE_ALLOWED_STATES = {
     TaskState.AwaitingInput,
     TaskState.AwaitingCompletion,
 }
-_BRAIN = DeepSeekChatBrain()
-
-
 def _text_from(command: TaskCommand) -> str:
     for item in command.dataItems or []:
         if isinstance(item, TextDataItem):
@@ -71,13 +68,13 @@ def _contains_non_text_data(command: TaskCommand) -> bool:
     return False
 
 
-def _build_answer(user_text: str) -> str:
-    # Fallback answer when LLM is not configured or unavailable.
-    return f"已收到文本咨询：{user_text}"
-
-
 def _is_terminal(task: TaskResult) -> bool:
     return task.status.state in TERMINAL_STATES
+
+
+def _conversation_key(command: TaskCommand) -> str:
+    session = command.sessionId or command.taskId
+    return f"partner:{session}"
 
 
 async def on_start(command: TaskCommand, task: TaskResult | None) -> TaskResult:
@@ -91,13 +88,7 @@ async def on_start(command: TaskCommand, task: TaskResult | None) -> TaskResult:
     if not user_text:
         return _ask_for_text_input(command)
 
-    answer = _build_answer(user_text)
-    if _BRAIN.enabled:
-        try:
-            answer = await _BRAIN.chat(user_text)
-        except Exception:
-            # Keep service available even if upstream LLM is unstable.
-            answer = _build_answer(user_text)
+    answer = await build_chat_answer(user_text, conversation_key=_conversation_key(command))
 
     task = TaskManager.create_task(command, initial_state=TaskState.AwaitingCompletion)
     _set_chat_product(task.taskId, answer)
@@ -124,12 +115,7 @@ async def on_continue(command: TaskCommand, task: TaskResult) -> TaskResult:
     if not user_text:
         return _with_sender(task)
 
-    answer = f"已收到补充信息：{user_text}"
-    if _BRAIN.enabled:
-        try:
-            answer = await _BRAIN.chat(user_text)
-        except Exception:
-            answer = f"已收到补充信息：{user_text}"
+    answer = await build_chat_answer(user_text, conversation_key=_conversation_key(command))
 
     _set_chat_product(task.taskId, answer)
     updated = TaskManager.update_task_status(task.taskId, TaskState.AwaitingCompletion)
