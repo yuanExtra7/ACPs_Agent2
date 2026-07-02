@@ -1,4 +1,4 @@
-"""Leader capability: call Partner agents via AIP RPC with task lifecycle control."""
+"""Leader-side RPC orchestration for Partner task lifecycle operations."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ POLLING_STATES = {TaskState.Accepted, TaskState.Working}
 
 
 def _state_name(state: object) -> str:
+    """Normalize enum/object state values into strings."""
     value = getattr(state, "value", None)
     if isinstance(value, str):
         return value
@@ -24,6 +25,7 @@ def _state_name(state: object) -> str:
 
 
 def _extract_text_items(items: object) -> list[str]:
+    """Extract text content from SDK objects and dict-shaped payloads."""
     texts: list[str] = []
     for item in items or []:
         if isinstance(item, TextDataItem):
@@ -43,6 +45,7 @@ def _extract_text_items(items: object) -> list[str]:
 
 
 def _snapshot_task(step: str, task: object) -> dict[str, object]:
+    """Convert a task object to a compact trace snapshot."""
     status = getattr(task, "status", SimpleNamespace(state="unknown", dataItems=[]))
     state = getattr(status, "state", "unknown")
     status_texts = _extract_text_items(getattr(status, "dataItems", []))
@@ -67,6 +70,7 @@ async def _poll_until_stable(
     trace: list[dict[str, object]],
     timeout_seconds: float,
 ) -> tuple[object, bool]:
+    """Poll get_task until state stabilizes or polling limit is reached."""
     polls = 0
     task = await asyncio.wait_for(
         client.get_task(task_id=task_id, session_id=session_id),
@@ -95,6 +99,7 @@ def _build_result(
     timed_out: bool,
     memory_key: str,
 ) -> dict[str, object]:
+    """Build the unified Leader response payload."""
     product_texts = [
         text
         for product in getattr(task, "products", []) or []
@@ -145,6 +150,7 @@ async def leader_start_task(
     max_polls: int = LEADER_MAX_POLLS,
     timeout_seconds: float = LEADER_CALL_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
+    """Send start command and optionally poll while task is in progress."""
     actual_task_id = task_id or f"task-{uuid4()}"
     trace: list[dict[str, object]] = []
     memory_key = f"leader:{leader_id}:{partner_rpc_url}:{session_id}"
@@ -192,6 +198,7 @@ async def leader_get_task(
     max_polls: int = LEADER_MAX_POLLS,
     timeout_seconds: float = LEADER_CALL_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
+    """Fetch task status and optionally poll while still processing."""
     trace: list[dict[str, object]] = []
     memory_key = f"leader:{leader_id}:{partner_rpc_url}:{session_id}"
     client = AipRpcClient(partner_url=partner_rpc_url, leader_id=leader_id)
@@ -238,6 +245,7 @@ async def leader_continue_task(
     max_polls: int = LEADER_MAX_POLLS,
     timeout_seconds: float = LEADER_CALL_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
+    """Send continue command and return updated remote task state."""
     trace: list[dict[str, object]] = []
     memory_key = f"leader:{leader_id}:{partner_rpc_url}:{session_id}"
     MEMORY.append(memory_key, "user", continue_input)
@@ -282,6 +290,7 @@ async def leader_complete_task(
     task_id: str,
     timeout_seconds: float = LEADER_CALL_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
+    """Send complete command to finish an awaiting-completion task."""
     trace: list[dict[str, object]] = []
     memory_key = f"leader:{leader_id}:{partner_rpc_url}:{session_id}"
     client = AipRpcClient(partner_url=partner_rpc_url, leader_id=leader_id)
@@ -316,7 +325,7 @@ async def run_leader_partner_chat(
     max_polls: int = LEADER_MAX_POLLS,
     auto_complete: bool = True,
 ) -> dict[str, object]:
-    """Backward-compatible wrapper for one-shot workflow."""
+    """Backward-compatible one-shot wrapper for start/continue/complete flows."""
     session_id = conversation_id or f"session-{uuid4()}"
     result = await leader_start_task(
         partner_rpc_url=partner_rpc_url,

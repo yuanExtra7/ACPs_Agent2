@@ -49,6 +49,7 @@ MIN_RETRY_BUDGET_SECONDS = 5.0
 
 
 def _extract_rpc_url(text: str) -> str:
+    """Extract the first RPC URL candidate from user input text."""
     match = _RPC_URL_RE.search(text)
     if not match:
         return ""
@@ -56,12 +57,14 @@ def _extract_rpc_url(text: str) -> str:
 
 
 def _remove_url(text: str, url: str) -> str:
+    """Remove a known URL token from text before intent routing."""
     if not url:
         return text
     return text.replace(url, " ").strip()
 
 
 def _resolve_answer_from_leader(result: dict[str, object]) -> str:
+    """Resolve displayable answer text from Leader response fields."""
     product_texts = result.get("product_texts") or []
     status_texts = result.get("status_texts") or []
     if product_texts:
@@ -73,10 +76,12 @@ def _resolve_answer_from_leader(result: dict[str, object]) -> str:
 
 
 def _normalize_state(state: str) -> str:
+    """Normalize state strings to lowercase kebab-case form."""
     return state.strip().lower().replace("_", "-")
 
 
 def _exception_text(exc: Exception) -> str:
+    """Return a non-empty exception string for user-facing diagnostics."""
     text = str(exc).strip()
     if text:
         return text
@@ -84,6 +89,7 @@ def _exception_text(exc: Exception) -> str:
 
 
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    """Check whether input text contains any keyword token."""
     lowered = text.strip().lower()
     if not lowered:
         return False
@@ -94,10 +100,12 @@ def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
 
 
 def _is_followup_intent(text: str) -> bool:
+    """Detect whether the user likely wants to continue the prior task."""
     return _contains_any(text, FOLLOWUP_HINTS)
 
 
 def _is_complete_intent(text: str) -> bool:
+    """Detect explicit completion intent for an awaiting-completion task."""
     return _contains_any(text, COMPLETE_HINTS)
 
 
@@ -107,6 +115,12 @@ def _resolve_action_for_awaiting_completion(
     action: str,
     text: str,
 ) -> tuple[str, bool]:
+    """Adjust routing action when session is stuck in awaiting-completion.
+
+    Returns:
+    - resolved action string
+    - whether stale task state should be reset
+    """
     normalized_state = _normalize_state(state.last_state)
     if normalized_state != "awaiting-completion" or not state.active_task_id:
         return action, False
@@ -119,6 +133,7 @@ def _resolve_action_for_awaiting_completion(
 
 
 def _session_valid_for_active_task(state: SessionRuntimeState) -> bool:
+    """Validate whether current active task metadata can still be trusted."""
     if not state.active_task_id:
         return True
     normalized = _normalize_state(state.last_state)
@@ -141,6 +156,7 @@ def _collaboration_payload(
     timings_ms: dict[str, int] | None = None,
     retryable: bool = False,
 ) -> dict[str, object]:
+    """Build a normalized collaboration payload for API responses."""
     return {
         "state": state.last_state,
         "taskId": state.active_task_id,
@@ -161,6 +177,7 @@ def _leader_binding_ok(
     state: SessionRuntimeState,
     leader_result: dict[str, object],
 ) -> bool:
+    """Verify task/session binding consistency between request and response."""
     if not bool(leader_result.get("binding_ok", True)):
         return False
     actual_task = str(leader_result.get("actual_task_id", "")).strip()
@@ -176,6 +193,7 @@ def _leader_binding_ok(
 
 
 def _rebuild_session_state(state: SessionRuntimeState) -> SessionRuntimeState:
+    """Reset task-specific runtime fields while preserving session continuity."""
     state.active_task_id = ""
     state.last_state = ""
     if not state.aip_session_id:
@@ -195,6 +213,7 @@ def _leader_error_response(
     timings_ms: dict[str, int] | None = None,
     retryable: bool = True,
 ) -> dict[str, object]:
+    """Create a structured leader-error response body."""
     return {
         "answer": answer,
         "mode": "leader-error",
@@ -213,6 +232,7 @@ def _leader_error_response(
 
 
 def _append_chat_exchange_if_new(chat_key: str, user_text: str, answer: str) -> bool:
+    """Append one exchange unless it looks like stale duplicate output."""
     history = MEMORY.get_history(chat_key)
     if len(history) >= 2:
         prev_user = history[-2]
@@ -229,11 +249,13 @@ def _append_chat_exchange_if_new(chat_key: str, user_text: str, answer: str) -> 
 
 
 def _remaining_budget(start_total: float) -> float:
+    """Return remaining request budget in seconds."""
     elapsed = perf_counter() - start_total
     return max(0.0, HUMAN_TOTAL_BUDGET_SECONDS - elapsed)
 
 
 def _call_proof_for_failure(*, state: SessionRuntimeState, reason: str) -> dict[str, object]:
+    """Create fallback call-proof metadata for failure paths."""
     return {
         "invoked": False,
         "request_id": f"proof-{uuid4()}",
@@ -246,6 +268,7 @@ def _call_proof_for_failure(*, state: SessionRuntimeState, reason: str) -> dict[
 
 
 def _proof_allows_remote_claim(call_proof: dict[str, object]) -> bool:
+    """Check if call-proof evidence is sufficient to claim remote execution."""
     if not bool(call_proof.get("invoked", False)):
         return False
     steps = [str(step) for step in call_proof.get("trace_steps", [])]
@@ -263,6 +286,7 @@ def _merge_session_state(
     aip_session_id: str,
     leader_result: dict[str, object],
 ) -> SessionRuntimeState:
+    """Merge Leader call result back into persisted session runtime state."""
     final_state = str(leader_result.get("final_state", "")).strip()
     active_task_id = str(leader_result.get("task_id", "")).strip()
     if final_state.lower() in TERMINAL_STATES:
@@ -277,6 +301,7 @@ def _merge_session_state(
 
 @router.get("", response_class=HTMLResponse)
 async def human_chat_page() -> str:
+    """Serve the built-in Human chat page."""
     return """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -574,6 +599,7 @@ async def human_chat_page() -> str:
 
 @router.post("/chat")
 async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
+    """Main Human chat endpoint with local/remote orchestration logic."""
     start_total = perf_counter()
     timings_ms: dict[str, int] = {}
     session_id = (payload.session_id or "").strip() or f"session-{uuid4()}"

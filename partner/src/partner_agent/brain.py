@@ -1,4 +1,4 @@
-"""LLM-backed response generation for Partner agent."""
+"""Model adapter used by Partner and Human orchestration flows."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from .settings import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPS
 
 class DeepSeekChatBrain:
     def __init__(self) -> None:
+        """Load model connection settings from runtime configuration."""
         self._base_url = DEEPSEEK_BASE_URL.rstrip("/")
         self._api_key = DEEPSEEK_API_KEY
         self._model = DEEPSEEK_MODEL
@@ -18,6 +19,7 @@ class DeepSeekChatBrain:
 
     @property
     def enabled(self) -> bool:
+        """Return whether model configuration is present and non-empty."""
         return bool(self._base_url and self._api_key and self._model)
 
     async def chat(
@@ -27,6 +29,7 @@ class DeepSeekChatBrain:
         system_prompt: str | None = None,
         timeout_seconds: float | None = None,
     ) -> str:
+        """Execute one chat completion request and return plain text content."""
         if not self.enabled:
             raise RuntimeError("DeepSeek brain is not configured")
 

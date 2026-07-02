@@ -1,4 +1,4 @@
-"""AIP command handlers for Direct RPC partner."""
+"""Direct RPC AIP command handlers for the Partner role."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ CONTINUE_ALLOWED_STATES = {
     TaskState.AwaitingCompletion,
 }
 def _text_from(command: TaskCommand) -> str:
+    """Extract the first text data item from a command."""
     for item in command.dataItems or []:
         if isinstance(item, TextDataItem):
             return item.text
@@ -26,11 +27,13 @@ def _text_from(command: TaskCommand) -> str:
 
 
 def _with_sender(task: TaskResult) -> TaskResult:
+    """Inject the current Partner sender ID into task responses."""
     task.senderId = PARTNER_AIC
     return task
 
 
 def _ask_for_text_input(command: TaskCommand) -> TaskResult:
+    """Create an AwaitingInput task when required text is missing."""
     task = TaskManager.create_task(
         command,
         initial_state=TaskState.AwaitingInput,
@@ -40,6 +43,7 @@ def _ask_for_text_input(command: TaskCommand) -> TaskResult:
 
 
 def _reject_non_text_request(command: TaskCommand) -> TaskResult:
+    """Reject commands containing non-text data items."""
     task = TaskManager.create_task(
         command,
         initial_state=TaskState.Rejected,
@@ -49,6 +53,7 @@ def _reject_non_text_request(command: TaskCommand) -> TaskResult:
 
 
 def _set_chat_product(task_id: str, answer_text: str) -> None:
+    """Write generated text output into the task product list."""
     TaskManager.set_products(
         task_id,
         [
@@ -62,6 +67,7 @@ def _set_chat_product(task_id: str, answer_text: str) -> None:
 
 
 def _contains_non_text_data(command: TaskCommand) -> bool:
+    """Return True when any incoming data item is not text."""
     for item in command.dataItems or []:
         if not isinstance(item, TextDataItem):
             return True
@@ -69,15 +75,18 @@ def _contains_non_text_data(command: TaskCommand) -> bool:
 
 
 def _is_terminal(task: TaskResult) -> bool:
+    """Check whether a task already reached a terminal state."""
     return task.status.state in TERMINAL_STATES
 
 
 def _conversation_key(command: TaskCommand) -> str:
+    """Build the chat-memory key used by the model layer."""
     session = command.sessionId or command.taskId
     return f"partner:{session}"
 
 
 async def on_start(command: TaskCommand, task: TaskResult | None) -> TaskResult:
+    """Handle start command and move task into AwaitingCompletion when ready."""
     if task:
         return _with_sender(task)
 
@@ -96,6 +105,7 @@ async def on_start(command: TaskCommand, task: TaskResult | None) -> TaskResult:
 
 
 async def on_continue(command: TaskCommand, task: TaskResult) -> TaskResult:
+    """Handle continue command with idempotent behavior outside allowed states."""
     # Keep continue idempotent outside allowed states.
     if _is_terminal(task) or task.status.state not in CONTINUE_ALLOWED_STATES:
         TaskManager.add_command_to_history(task.taskId, command)

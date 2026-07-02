@@ -1,4 +1,4 @@
-"""Shared chat logic for partner and human-facing APIs."""
+"""Shared chat/orchestration utilities for Partner and Human APIs."""
 
 from __future__ import annotations
 
@@ -26,10 +26,12 @@ RouterAction = Literal[
 
 
 def fallback_answer(user_text: str) -> str:
+    """Return a deterministic fallback message when model calls are unavailable."""
     return f"已收到文本咨询：{user_text}"
 
 
 def _extract_json_object(text: str) -> dict[str, object]:
+    """Extract and parse one JSON object from potentially noisy model output."""
     raw = text.strip()
     if raw.startswith("```"):
         lines = [line for line in raw.splitlines() if not line.strip().startswith("```")]
@@ -51,6 +53,7 @@ async def decide_human_action(
     has_active_task: bool,
     active_task_state: str,
 ) -> dict[str, str]:
+    """Decide whether to answer locally or call/continue/complete remote tasks."""
     text = user_text.strip()
     if not text:
         return {"action": "local_reply"}
@@ -111,7 +114,7 @@ async def postprocess_collaboration_result(
     call_proof: dict[str, object] | None = None,
     conversation_key: str | None = None,
 ) -> str:
-    """Use model to transform partner output according to user instruction."""
+    """Transform raw partner output into user-facing delivery text."""
     partner_text = partner_response.strip()
     if not partner_text:
         partner_texts = leader_result.get("product_texts") or leader_result.get("status_texts") or []
@@ -160,7 +163,7 @@ async def is_partner_response_relevant(
     partner_response: str,
     conversation_key: str | None = None,
 ) -> bool:
-    """Ask model whether partner response matches current user request."""
+    """Judge whether partner output is semantically relevant to the current request."""
     request_text = user_request.strip()
     response_text = partner_response.strip()
     if not request_text or not response_text:
@@ -205,6 +208,7 @@ async def build_chat_answer(
     *,
     conversation_key: str | None = None,
 ) -> str:
+    """Generate a reply with model-first and fallback-second behavior."""
     text = user_text.strip()
     if not text:
         return "请输入文本内容。"

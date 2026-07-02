@@ -1,4 +1,4 @@
-"""FastAPI app exposing ACPs AIP RPC endpoint."""
+"""FastAPI application entrypoint for Partner, Leader, and Human routes."""
 
 from __future__ import annotations
 
@@ -31,5 +31,6 @@ app.include_router(human_router)
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Expose service liveness and current Partner identity."""
     return {"status": "ok", "aic": PARTNER_AIC}
 

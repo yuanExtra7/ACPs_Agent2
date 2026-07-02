@@ -1,4 +1,4 @@
-"""FastAPI routes exposing Leader capability."""
+"""HTTP routes that expose the embedded Leader capability."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ router = APIRouter(prefix="/leader", tags=["leader"])
 
 
 class LeaderChatRequest(BaseModel):
+    """Request model for a single Leader-to-Partner collaboration call."""
     partner_rpc_url: str = Field(..., description="Target Partner AIP RPC endpoint URL")
     user_input: str = Field(..., min_length=1, description="Leader start input text")
     continue_input: str = Field("请补充更细节的说明。", description="Used when partner asks for more input")
@@ -27,11 +28,13 @@ class LeaderChatRequest(BaseModel):
 
 @router.get("/health")
 async def leader_health() -> dict[str, str]:
+    """Return health metadata for the Leader submodule."""
     return {"status": "ok", "leaderAic": LEADER_AIC}
 
 
 @router.post("/chat")
 async def leader_chat(payload: LeaderChatRequest) -> dict[str, object]:
+    """Run one end-to-end Leader orchestration call and return its result."""
     return await run_leader_partner_chat(
         partner_rpc_url=payload.partner_rpc_url,
         leader_id=payload.leader_id,
