@@ -8,12 +8,18 @@ from typing import Literal
 
 from .brain import DeepSeekChatBrain
 from .memory import MEMORY
+from .settings import POSTPROCESS_WITH_LLM
 
 _BRAIN = DeepSeekChatBrain()
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 ROUTER_TIMEOUT_SECONDS = 8.0
 POSTPROCESS_TIMEOUT_SECONDS = 12.0
 RELEVANCE_TIMEOUT_SECONDS = 4.0
+NO_PROOF_PHRASES = (
+    "当前未得到有效远端响应证据",
+    "未得到有效远端响应证据",
+    "未取得有效远端调用证据",
+)
 
 RouterAction = Literal[
     "call_start",
@@ -43,6 +49,36 @@ def _extract_json_object(text: str) -> dict[str, object]:
     if not isinstance(data, dict):
         raise ValueError("router output is not a json object")
     return data
+
+
+def _rule_based_relevance(user_request: str, partner_response: str) -> bool:
+    """Fast lexical fallback relevance check to reduce LLM false negatives."""
+    request_text = user_request.strip()
+    response_text = partner_response.strip()
+    if not request_text or not response_text:
+        return False
+
+    request_tokens = {token.lower() for token in request_text.split() if len(token) > 1}
+    response_lower = response_text.lower()
+    if request_tokens and any(token in response_lower for token in request_tokens):
+        return True
+
+    request_chars = {ch for ch in request_text if ch.strip()}
+    response_chars = {ch for ch in response_text if ch.strip()}
+    if not request_chars:
+        return False
+    overlap = len(request_chars & response_chars) / max(len(request_chars), 1)
+    return overlap >= 0.2
+
+
+def _has_valid_call_proof(call_proof: dict[str, object] | None) -> bool:
+    """Check whether call proof is strong enough for trusted post-processing."""
+    if not call_proof:
+        return False
+    if not bool(call_proof.get("invoked", False)):
+        return False
+    steps = [str(step) for step in call_proof.get("trace_steps", []) if str(step).strip()]
+    return bool(steps)
 
 
 async def decide_human_action(
@@ -126,6 +162,15 @@ async def postprocess_collaboration_result(
     if not _BRAIN.enabled:
         return partner_text
 
+    # Simplified default: return remote output directly unless explicitly enabling LLM rewrite.
+    if not POSTPROCESS_WITH_LLM:
+        return partner_text
+
+    # If remote task is still processing, avoid LLM rewriting into misleading "no evidence" text.
+    final_state = str(leader_result.get("final_state", "")).strip().lower()
+    if final_state in {"accepted", "working"} and partner_text.startswith("协作已执行，当前任务状态："):
+        return partner_text
+
     history = MEMORY.get_history(conversation_key) if conversation_key else []
     system_prompt = (
         "你是协作结果整合助手。必须严格根据用户要求处理远端智能体返回内容。\n"
@@ -147,12 +192,16 @@ async def postprocess_collaboration_result(
         ensure_ascii=False,
     )
     try:
-        return await _BRAIN.chat(
+        rendered = await _BRAIN.chat(
             payload,
             history=history,
             system_prompt=system_prompt,
             timeout_seconds=POSTPROCESS_TIMEOUT_SECONDS,
         )
+        if _has_valid_call_proof(call_proof):
+            if any(phrase in rendered for phrase in NO_PROOF_PHRASES):
+                return partner_text
+        return rendered
     except Exception:
         return partner_text
 
@@ -170,15 +219,7 @@ async def is_partner_response_relevant(
         return False
 
     if not _BRAIN.enabled:
-        request_tokens = {token for token in request_text.split() if len(token) > 1}
-        if request_tokens and any(token in response_text for token in request_tokens):
-            return True
-        request_chars = {ch for ch in request_text if ch.strip()}
-        response_chars = {ch for ch in response_text if ch.strip()}
-        if not request_chars:
-            return False
-        overlap = len(request_chars & response_chars) / max(len(request_chars), 1)
-        return overlap >= 0.2
+        return _rule_based_relevance(request_text, response_text)
 
     history = MEMORY.get_history(conversation_key) if conversation_key else []
     prompt = (
@@ -198,9 +239,13 @@ async def is_partner_response_relevant(
             timeout_seconds=RELEVANCE_TIMEOUT_SECONDS,
         )
         data = _extract_json_object(model_output)
-        return bool(data.get("relevant", False))
+        llm_relevant = bool(data.get("relevant", False))
+        if llm_relevant:
+            return True
+        # Keep a deterministic lexical fallback to avoid over-strict false negatives.
+        return _rule_based_relevance(request_text, response_text)
     except Exception:
-        return False
+        return _rule_based_relevance(request_text, response_text)
 
 
 async def build_chat_answer(

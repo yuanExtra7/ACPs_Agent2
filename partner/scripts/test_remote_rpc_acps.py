@@ -88,7 +88,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Use ACPs AipRpcClient to call remote Partner")
     parser.add_argument(
         "--partner-rpc-url",
-        default="http://113.47.5.136:5000/rpc",
+        default="http://113.47.5.136/rpc",
         help="Remote Partner RPC URL",
     )
     parser.add_argument("--leader-id", default="local-leader-acps-test", help="Leader senderId")

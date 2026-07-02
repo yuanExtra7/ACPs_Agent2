@@ -37,6 +37,16 @@ def _mock_leader_complete(monkeypatch):
     monkeypatch.setattr(human_api, "leader_complete_task", _fake_complete)
 
 
+@pytest.fixture(autouse=True)
+def _disable_auto_discovery_by_default(monkeypatch):
+    monkeypatch.setattr(human_api, "AUTO_DISCOVERY_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _disable_force_remote_by_default(monkeypatch):
+    monkeypatch.setattr(human_api, "HUMAN_FORCE_REMOTE_COLLAB", False)
+
+
 def test_human_chat_page_available() -> None:
     client = TestClient(app)
     response = client.get("/human")
@@ -240,6 +250,254 @@ def test_human_chat_rpc_intent_without_url_returns_hint(monkeypatch) -> None:
     assert "请提供可访问的 RPC 地址" in data["answer"]
 
 
+def test_human_chat_auto_discovery_calls_remote(monkeypatch) -> None:
+    _reset_session("auto-discover-1")
+    monkeypatch.setattr(human_api, "AUTO_DISCOVERY_ENABLED", True)
+
+    async def _fake_decision(
+        _: str,
+        *,
+        router_history_key: str,
+        candidate_rpc_url: str | None,
+        has_active_task: bool,
+        active_task_state: str,
+    ):
+        assert candidate_rpc_url is None
+        return {"action": "need_rpc_url", "query": "文本咨询伙伴智能体"}
+
+    async def _fake_auto_discovery(*, text: str, decision_query: str, state):
+        assert "文本咨询伙伴智能体" in decision_query
+        state.discovered_partner_aic = "aic-discovered"
+        state.discovered_partner_name = "发现到的智能体"
+        state.discovery_query = decision_query
+        state.discovery_total_candidates = 3
+        state.discovery_error = ""
+        return "http://127.0.0.1:5001/rpc", ""
+
+    async def _fake_start(**kwargs):
+        assert kwargs["partner_rpc_url"] == "http://127.0.0.1:5001/rpc"
+        return {
+            "final_state": "awaiting-completion",
+            "task_id": "task-auto-1",
+            "partner_sender_id": "aic-discovered",
+            "binding_ok": True,
+            "product_texts": ["自动发现后调用成功"],
+            "status_texts": [],
+            "trace": [{"step": "start"}],
+            "call_proof": {"invoked": True, "trace_steps": ["start"]},
+        }
+
+    monkeypatch.setattr(human_api, "decide_human_action", _fake_decision)
+    monkeypatch.setattr(human_api, "_try_auto_discovery", _fake_auto_discovery)
+    monkeypatch.setattr(human_api, "leader_start_task", _fake_start)
+    monkeypatch.setattr(human_api, "is_partner_response_relevant", _always_relevant)
+    monkeypatch.setattr(human_api, "postprocess_collaboration_result", _passthrough_postprocess)
+
+    client = TestClient(app)
+    response = client.post(
+        "/human/chat",
+        json={"text": "帮我自动发现并调用", "session_id": "auto-discover-1"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "leader-proxy"
+    assert data["answer"] == "自动发现后调用成功"
+    assert data["collaboration"]["effectiveRpcUrl"] == "http://127.0.0.1:5001/rpc"
+    assert data["collaboration"]["discoveredAgentAic"] == "aic-discovered"
+    assert data["collaboration"]["discoveredAgentName"] == "发现到的智能体"
+
+
+def test_manual_sidebar_rpc_forces_remote_call(monkeypatch) -> None:
+    _reset_session("manual-rpc-1")
+
+    async def _fake_decision(
+        _: str,
+        *,
+        router_history_key: str,
+        candidate_rpc_url: str | None,
+        has_active_task: bool,
+        active_task_state: str,
+    ):
+        # Even if router says local, manual sidebar RPC should force call_start.
+        return {"action": "local_reply", "query": "请协作回答"}
+
+    async def _fake_start(**kwargs):
+        assert kwargs["partner_rpc_url"] == "https://www.ioa.pub/api/finance/aip"
+        return {
+            "final_state": "completed",
+            "task_id": "task-manual-1",
+            "partner_sender_id": "finance-aic",
+            "binding_ok": True,
+            "product_texts": ["手填地址强制协作成功"],
+            "status_texts": [],
+            "trace": [{"step": "start"}],
+            "call_proof": {"invoked": True, "trace_steps": ["start"]},
+        }
+
+    monkeypatch.setattr(human_api, "decide_human_action", _fake_decision)
+    monkeypatch.setattr(human_api, "leader_start_task", _fake_start)
+    monkeypatch.setattr(human_api, "is_partner_response_relevant", _always_relevant)
+    monkeypatch.setattr(human_api, "postprocess_collaboration_result", _passthrough_postprocess)
+
+    client = TestClient(app)
+    response = client.post(
+        "/human/chat",
+        json={
+            "text": "请帮我协作回答英伟达股价",
+            "session_id": "manual-rpc-1",
+            "rpc_url": "https://www.ioa.pub/api/finance/aip",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "leader-proxy"
+    assert data["answer"] == "手填地址强制协作成功"
+
+
+def test_force_remote_collaboration_always_calls_start(monkeypatch) -> None:
+    _reset_session("force-remote-1")
+    monkeypatch.setattr(human_api, "HUMAN_FORCE_REMOTE_COLLAB", True)
+    monkeypatch.setattr(human_api, "AUTO_DISCOVERY_ENABLED", True)
+
+    starts: list[str] = []
+
+    async def _fake_decision(
+        _: str,
+        *,
+        router_history_key: str,
+        candidate_rpc_url: str | None,
+        has_active_task: bool,
+        active_task_state: str,
+    ):
+        return {"action": "local_reply"}
+
+    async def _fake_auto_discovery(*, text: str, decision_query: str, state):
+        state.discovered_partner_aic = "aic-remote-force"
+        state.discovered_partner_name = "远端智能体B"
+        state.discovery_query = decision_query or text
+        state.discovery_total_candidates = 1
+        state.discovery_error = ""
+        return "https://example.com/rpc", ""
+
+    async def _fake_start(**kwargs):
+        starts.append(str(kwargs["user_input"]))
+        return {
+            "final_state": "completed",
+            "task_id": f"task-{len(starts)}",
+            "partner_sender_id": "aic-remote-force",
+            "binding_ok": True,
+            "product_texts": [f"远端回复{len(starts)}"],
+            "status_texts": [],
+            "trace": [{"step": "start"}],
+            "call_proof": {"invoked": True, "trace_steps": ["start"]},
+        }
+
+    monkeypatch.setattr(human_api, "decide_human_action", _fake_decision)
+    monkeypatch.setattr(human_api, "_try_auto_discovery", _fake_auto_discovery)
+    monkeypatch.setattr(human_api, "leader_start_task", _fake_start)
+    monkeypatch.setattr(human_api, "is_partner_response_relevant", _always_relevant)
+    monkeypatch.setattr(human_api, "postprocess_collaboration_result", _passthrough_postprocess)
+
+    client = TestClient(app)
+    r1 = client.post("/human/chat", json={"text": "第一问", "session_id": "force-remote-1"})
+    r2 = client.post("/human/chat", json={"text": "第二问", "session_id": "force-remote-1"})
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json()["mode"] == "leader-proxy"
+    assert r2.json()["mode"] == "leader-proxy"
+    assert r1.json()["answer"] == "远端回复1"
+    assert r2.json()["answer"] == "远端回复2"
+    assert len(starts) == 2
+
+
+def test_local_reply_hides_stale_remote_runtime_info(monkeypatch) -> None:
+    SESSION_STATES.update(
+        "local-clear-1",
+        rpc_url="https://www.ioa.pub/api/finance/aip",
+        aip_session_id="aip-local-clear",
+        active_task_id="",
+        last_state="completed",
+        partner_sender_id="server",
+    )
+
+    async def _fake_decision(
+        _: str,
+        *,
+        router_history_key: str,
+        candidate_rpc_url: str | None,
+        has_active_task: bool,
+        active_task_state: str,
+    ):
+        return {"action": "local_reply"}
+
+    async def _fake_answer(_: str, *, conversation_key: str | None = None) -> str:
+        return "这是本地回复"
+
+    monkeypatch.setattr(human_api, "decide_human_action", _fake_decision)
+    monkeypatch.setattr(human_api, "build_chat_answer", _fake_answer)
+
+    client = TestClient(app)
+    response = client.post("/human/chat", json={"text": "你好", "session_id": "local-clear-1"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "local-chat"
+    assert data["collaboration"]["effectiveRpcUrl"] == ""
+    assert data["collaboration"]["state"] == ""
+
+
+def test_force_collaboration_intent_overrides_local_reply(monkeypatch) -> None:
+    _reset_session("force-collab-1")
+    monkeypatch.setattr(human_api, "AUTO_DISCOVERY_ENABLED", True)
+
+    async def _fake_decision(
+        _: str,
+        *,
+        router_history_key: str,
+        candidate_rpc_url: str | None,
+        has_active_task: bool,
+        active_task_state: str,
+    ):
+        return {"action": "local_reply"}
+
+    async def _fake_auto_discovery(*, text: str, decision_query: str, state):
+        state.discovered_partner_aic = "aic-remote-1"
+        state.discovered_partner_name = "远端智能体A"
+        state.discovery_query = decision_query
+        state.discovery_total_candidates = 2
+        state.discovery_error = ""
+        return "https://example.com/rpc", ""
+
+    async def _fake_start(**kwargs):
+        assert kwargs["partner_rpc_url"] == "https://example.com/rpc"
+        return {
+            "final_state": "completed",
+            "task_id": "task-force-1",
+            "partner_sender_id": "aic-remote-1",
+            "binding_ok": True,
+            "product_texts": ["远端已返回结果"],
+            "status_texts": [],
+            "trace": [{"step": "start"}],
+            "call_proof": {"invoked": True, "trace_steps": ["start"]},
+        }
+
+    monkeypatch.setattr(human_api, "decide_human_action", _fake_decision)
+    monkeypatch.setattr(human_api, "_try_auto_discovery", _fake_auto_discovery)
+    monkeypatch.setattr(human_api, "leader_start_task", _fake_start)
+    monkeypatch.setattr(human_api, "is_partner_response_relevant", _always_relevant)
+    monkeypatch.setattr(human_api, "postprocess_collaboration_result", _passthrough_postprocess)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/human/chat",
+        json={"text": "现在我希望你和其它智能体合作介绍一下CSGO", "session_id": "force-collab-1"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mode"] == "leader-proxy"
+    assert data["answer"] == "远端已返回结果"
+
+
 def test_state_guard_rebuilds_invalid_active_task(monkeypatch) -> None:
     SESSION_STATES.update(
         "guard-1",
@@ -409,7 +667,10 @@ def test_record2_flow_no_stale_repeat(monkeypatch) -> None:
         json={"text": "问问这个智能体你对奶妈有何看法", "session_id": "record2", "rpc_url": "http://123.249.107.155:5000/rpc"},
     )
     r3 = client.post("/human/chat", json={"text": "你还记得地址是多少吗？", "session_id": "record2"})
-    r4 = client.post("/human/chat", json={"text": "介绍特朗普", "session_id": "record2"})
+    r4 = client.post(
+        "/human/chat",
+        json={"text": "介绍特朗普", "session_id": "record2", "rpc_url": "http://123.249.107.155:5000/rpc"},
+    )
 
     assert r1.json()["answer"] == "奶牛是乳用品种牛。"
     assert r2.json()["answer"] == "这是远端对奶妈问题的回答。"
@@ -472,7 +733,10 @@ def test_record3_flow_no_topic_cross_talk(monkeypatch) -> None:
         json={"text": "请和这个地址协作青年话题", "session_id": "record3", "rpc_url": "http://123.249.107.155:5000/rpc"},
     )
     b = client.post("/human/chat", json={"text": "还记得地址吗？", "session_id": "record3"})
-    c = client.post("/human/chat", json={"text": "问它介绍特朗普", "session_id": "record3"})
+    c = client.post(
+        "/human/chat",
+        json={"text": "问它介绍特朗普", "session_id": "record3", "rpc_url": "http://123.249.107.155:5000/rpc"},
+    )
 
     assert a.json()["answer"] == "青年助力国家建设的讨论结果。"
     assert "123.249.107.155" in b.json()["answer"]

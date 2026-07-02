@@ -13,3 +13,9 @@ base_url = "https://ioa.pub/ca-server"
 [discovery]
 base_url = "https://ioa.pub/discovery"
 
+[mq]
+# mq-auth-server Group API（群组 ACL 管理）
+group_api_url = "https://ioa.pub:9007"
+# mq-auth-server Auth API（鉴权探测）
+# 你当前只给了 9007，这里先保持同地址；若平台单独开放 9008，再改为 9008。
+auth_api_url = "https://ioa.pub:9007"

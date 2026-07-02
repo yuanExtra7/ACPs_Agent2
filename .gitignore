@@ -11,3 +11,5 @@ partner/.env
 partner/.env.*
 partner/atr/.acps-cli/
 partner/atr/certs/
+partner/atr/keyfiles/
+partner/atr/private/

@@ -17,9 +17,23 @@ from .chat_service import (
     is_partner_response_relevant,
     postprocess_collaboration_result,
 )
+from .discovery_client import discover_partner_candidate
 from .leader import leader_complete_task, leader_continue_task, leader_get_task, leader_start_task
 from .memory import MEMORY, SESSION_STATES, SessionRuntimeState
-from .settings import HUMAN_TOTAL_BUDGET_SECONDS, LEADER_AIC, LEADER_CALL_TIMEOUT_SECONDS
+from .settings import (
+    ACPS_DISCOVERY_BASE_URL,
+    ACPS_DISCOVERY_EXCLUDE_SELF,
+    ACPS_DISCOVERY_LIMIT,
+    ACPS_DISCOVERY_TIMEOUT_SECONDS,
+    AUTO_DISCOVERY_ENABLED,
+    HUMAN_TOTAL_BUDGET_SECONDS,
+    HUMAN_FORCE_REMOTE_COLLAB,
+    LEADER_AIC,
+    LEADER_CALL_TIMEOUT_SECONDS,
+    LEADER_MAX_POLLS,
+    LEADER_POLL_SECONDS,
+    PARTNER_AIC,
+)
 
 router = APIRouter(prefix="/human", tags=["human-chat"])
 
@@ -34,6 +48,7 @@ _RPC_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 TERMINAL_STATES = {"completed", "failed", "rejected", "canceled"}
 ACTIVE_STATES = {"accepted", "working", "awaiting-input", "awaiting-completion"}
 ALL_STATES = TERMINAL_STATES | ACTIVE_STATES
+REMOTE_ACTIONS = {"call_start", "call_continue", "call_complete", "call_get", "need_rpc_url"}
 FOLLOWUP_HINTS = (
     "继续",
     "补充",
@@ -45,6 +60,17 @@ FOLLOWUP_HINTS = (
     "接着上个",
 )
 COMPLETE_HINTS = ("完成", "确认", "就这样", "结束", "提交")
+FORCE_COLLAB_HINTS = (
+    "其它智能体",
+    "其他智能体",
+    "互联",
+    "协作",
+    "合作",
+    "调用别的",
+    "调用其他",
+    "discover",
+    "discovery",
+)
 MIN_RETRY_BUDGET_SECONDS = 5.0
 
 
@@ -61,6 +87,44 @@ def _remove_url(text: str, url: str) -> str:
     if not url:
         return text
     return text.replace(url, " ").strip()
+
+
+def _resolve_discovery_query(*, text: str, decision_query: str) -> str:
+    """Build one discovery query from router hint and original text."""
+    hint = decision_query.strip()
+    if hint:
+        return hint
+    cleaned = text.strip()
+    return cleaned[:300]
+
+
+async def _try_auto_discovery(
+    *,
+    text: str,
+    decision_query: str,
+    state: SessionRuntimeState,
+) -> tuple[str, str]:
+    """Try official ACPs discovery and update session state when a candidate is found."""
+    query = _resolve_discovery_query(text=text, decision_query=decision_query)
+    exclude_aic = PARTNER_AIC if ACPS_DISCOVERY_EXCLUDE_SELF else ""
+    candidate, err = await discover_partner_candidate(
+        base_url=ACPS_DISCOVERY_BASE_URL,
+        query=query,
+        limit=ACPS_DISCOVERY_LIMIT,
+        timeout_seconds=ACPS_DISCOVERY_TIMEOUT_SECONDS,
+        exclude_aic=exclude_aic,
+    )
+    state.discovery_query = query
+    state.discovery_error = err
+    if candidate is None:
+        state.discovery_total_candidates = 0
+        return "", err
+    state.rpc_url = candidate.rpc_url
+    state.discovered_partner_aic = candidate.aic
+    state.discovered_partner_name = candidate.name
+    state.discovery_total_candidates = candidate.total_candidates
+    state.discovery_error = ""
+    return candidate.rpc_url, ""
 
 
 def _resolve_answer_from_leader(result: dict[str, object]) -> str:
@@ -107,6 +171,11 @@ def _is_followup_intent(text: str) -> bool:
 def _is_complete_intent(text: str) -> bool:
     """Detect explicit completion intent for an awaiting-completion task."""
     return _contains_any(text, COMPLETE_HINTS)
+
+
+def _is_force_collaboration_intent(text: str) -> bool:
+    """Detect explicit intent to collaborate with external agents."""
+    return _contains_any(text, FORCE_COLLAB_HINTS)
 
 
 def _resolve_action_for_awaiting_completion(
@@ -163,6 +232,11 @@ def _collaboration_payload(
         "effectiveRpcUrl": state.rpc_url,
         "aipSessionId": state.aip_session_id,
         "partnerSenderId": state.partner_sender_id,
+        "discoveredAgentAic": state.discovered_partner_aic,
+        "discoveredAgentName": state.discovered_partner_name,
+        "discoveryQuery": state.discovery_query,
+        "discoveryError": state.discovery_error,
+        "discoveryCandidates": state.discovery_total_candidates,
         "trace": trace or [],
         "recoveryHint": recovery_hint,
         "error": error,
@@ -170,6 +244,22 @@ def _collaboration_payload(
         "timingsMs": timings_ms or {},
         "retryable": retryable,
     }
+
+
+def _display_state_for_local_reply(state: SessionRuntimeState) -> SessionRuntimeState:
+    """Hide stale remote metadata in local-only responses."""
+    if state.active_task_id:
+        return state
+    snapshot = SessionRuntimeState(**state.__dict__)
+    snapshot.rpc_url = ""
+    snapshot.last_state = ""
+    snapshot.partner_sender_id = ""
+    snapshot.discovered_partner_aic = ""
+    snapshot.discovered_partner_name = ""
+    snapshot.discovery_query = ""
+    snapshot.discovery_error = ""
+    snapshot.discovery_total_candidates = 0
+    return snapshot
 
 
 def _leader_binding_ok(
@@ -254,6 +344,15 @@ def _remaining_budget(start_total: float) -> float:
     return max(0.0, HUMAN_TOTAL_BUDGET_SECONDS - elapsed)
 
 
+def _dynamic_max_polls(remaining_budget: float) -> int:
+    """Compute adaptive polling count from remaining budget."""
+    if remaining_budget <= 0:
+        return LEADER_MAX_POLLS
+    interval = max(0.2, LEADER_POLL_SECONDS)
+    budget_polls = int(max(0.0, remaining_budget - 1.0) / interval)
+    return max(LEADER_MAX_POLLS, min(40, budget_polls))
+
+
 def _call_proof_for_failure(*, state: SessionRuntimeState, reason: str) -> dict[str, object]:
     """Create fallback call-proof metadata for failure paths."""
     return {
@@ -291,6 +390,7 @@ def _merge_session_state(
     active_task_id = str(leader_result.get("task_id", "")).strip()
     if final_state.lower() in TERMINAL_STATES:
         active_task_id = ""
+        rpc_url = ""
     state.rpc_url = rpc_url
     state.aip_session_id = aip_session_id
     state.active_task_id = active_task_id
@@ -485,6 +585,8 @@ async def human_chat_page() -> str:
           state: -<br/>
           phase: -<br/>
           rpc: -<br/>
+          agent: -<br/>
+          discovery: -<br/>
           timings: -
         </div>
       </section>
@@ -542,14 +644,17 @@ async def human_chat_page() -> str:
       const state = collab.state || "-";
       const phase = collab.phase || "-";
       const rpc = collab.effectiveRpcUrl || "-";
+      const agentAic = collab.partnerSenderId || collab.discoveredAgentAic || "-";
+      const agentName = collab.discoveredAgentName || "-";
+      const discoveryQuery = collab.discoveryQuery || "-";
+      const discoveryCandidates = collab.discoveryCandidates ?? "-";
+      const discoveryError = collab.discoveryError || "-";
       const recoveryHint = collab.recoveryHint || "-";
       const error = collab.error || "-";
       const timings = collab.timingsMs || {};
       const timingText = Object.entries(timings).map(([k, v]) => `${k}:${v}ms`).join(", ") || "-";
-      runtimeInfoEl.innerHTML = `mode: ${mode}<br/>task: ${taskId}<br/>state: ${state}<br/>phase: ${phase}<br/>rpc: ${rpc}<br/>timings: ${timingText}<br/>recovery: ${recoveryHint}<br/>error: ${error}`;
-      if (collab.effectiveRpcUrl && !rpcUrlEl.value.trim()) {
-        rpcUrlEl.value = collab.effectiveRpcUrl;
-      }
+      const agentText = agentName !== "-" ? `${agentName} (${agentAic})` : (agentAic !== "-" ? agentAic : "-");
+      runtimeInfoEl.innerHTML = `mode: ${mode}<br/>task: ${taskId}<br/>state: ${state}<br/>phase: ${phase}<br/>rpc: ${rpc}<br/>agent: ${agentText}<br/>discovery: q=${discoveryQuery}; candidates=${discoveryCandidates}; err=${discoveryError}<br/>timings: ${timingText}<br/>recovery: ${recoveryHint}<br/>error: ${error}`;
     }
 
     async function sendMessage() {
@@ -558,7 +663,7 @@ async def human_chat_page() -> str:
       inputEl.value = "";
       appendMessage("user", text);
       sendBtn.disabled = true;
-      runtimeInfoEl.innerHTML = "mode: pending<br/>task: -<br/>state: -<br/>phase: calling<br/>rpc: -<br/>timings: -<br/>recovery: -<br/>error: -";
+      runtimeInfoEl.innerHTML = "mode: pending<br/>task: -<br/>state: -<br/>phase: calling<br/>rpc: -<br/>agent: -<br/>discovery: -<br/>timings: -<br/>recovery: -<br/>error: -";
       try {
         const resp = await fetch("/human/chat", {
           method: "POST",
@@ -619,9 +724,14 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
     state = SESSION_STATES.get(session_id)
     payload_rpc = (payload.rpc_url or "").strip()
     extracted_rpc = _extract_rpc_url(text)
-    rpc_url = payload_rpc or extracted_rpc or state.rpc_url
-    if rpc_url:
-        state.rpc_url = rpc_url
+    fallback_rpc = state.rpc_url if bool(state.active_task_id) else ""
+    rpc_url = payload_rpc or extracted_rpc or fallback_rpc
+    if payload_rpc or extracted_rpc:
+        state.discovered_partner_aic = ""
+        state.discovered_partner_name = ""
+        state.discovery_query = ""
+        state.discovery_error = ""
+        state.discovery_total_candidates = 0
     if not state.aip_session_id:
         state.aip_session_id = f"aip-{uuid4()}"
     if not _session_valid_for_active_task(state):
@@ -654,11 +764,32 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
     if reset_stale_task:
         state.active_task_id = ""
         state.last_state = ""
+    if HUMAN_FORCE_REMOTE_COLLAB:
+        # Product requirement: every user turn should invoke remote collaboration.
+        action = "call_start"
+        state.active_task_id = ""
+        state.last_state = ""
+    if (
+        action == "local_reply"
+        and AUTO_DISCOVERY_ENABLED
+        and not payload_rpc
+        and not extracted_rpc
+        and not state.active_task_id
+        and _is_force_collaboration_intent(text)
+    ):
+        action = "call_start"
+    if payload_rpc:
+        # Sidebar RPC input is an explicit user directive: force remote collaboration on that endpoint.
+        if action in {"local_reply", "need_rpc_url", "call_get"}:
+            action = "call_start"
+        if action == "call_continue" and not state.active_task_id:
+            action = "call_start"
     received_at = datetime.now().isoformat()
 
     if action == "local_reply":
         answer = await build_chat_answer(text, conversation_key=chat_key)
         SESSION_STATES.save(state)
+        display_state = _display_state_for_local_reply(state)
         return {
             "answer": answer,
             "mode": "local-chat",
@@ -666,14 +797,32 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
             "memoryTurns": MEMORY.size(chat_key),
             "receivedAt": received_at,
             "collaboration": _collaboration_payload(
-                state,
+                display_state,
                 phase="local-reply",
                 timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
             ),
         }
 
+    decision_query = str(decision.get("query", "")).strip()
+    if not rpc_url and action in REMOTE_ACTIONS and AUTO_DISCOVERY_ENABLED:
+        start_discovery = perf_counter()
+        discovered_rpc, discover_error = await _try_auto_discovery(
+            text=text,
+            decision_query=decision_query,
+            state=state,
+        )
+        timings_ms["discovery"] = int((perf_counter() - start_discovery) * 1000)
+        if discovered_rpc:
+            rpc_url = discovered_rpc
+            if action == "need_rpc_url":
+                action = "call_start"
+        elif discover_error and not state.discovery_error:
+            state.discovery_error = discover_error
+
     if action == "need_rpc_url":
         answer = "请提供可访问的 RPC 地址（http(s)://.../rpc），我才能发起真实调用。"
+        if state.discovery_error:
+            answer = f"{answer} 自动发现失败：{state.discovery_error}"
         SESSION_STATES.save(state)
         return {
             "answer": answer,
@@ -690,6 +839,8 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
 
     if not rpc_url:
         answer = "当前没有可用 RPC 地址，请在左侧填写或在消息中提供 http(s)://.../rpc。"
+        if state.discovery_error:
+            answer = f"{answer} 自动发现失败：{state.discovery_error}"
         SESSION_STATES.save(state)
         return {
             "answer": answer,
@@ -710,6 +861,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
         if remaining_before_leader <= 0:
             raise TimeoutError("end-to-end budget exhausted before leader call")
         call_timeout = min(LEADER_CALL_TIMEOUT_SECONDS, remaining_before_leader)
+        dynamic_polls = _dynamic_max_polls(remaining_before_leader)
 
         if action == "call_start":
             leader_query = (decision.get("query") or "").strip() or _remove_url(text, rpc_url).strip() or text
@@ -719,6 +871,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                 session_id=state.aip_session_id,
                 user_input=leader_query,
                 task_id=None,
+                max_polls=dynamic_polls,
                 timeout_seconds=call_timeout,
             )
         elif action == "call_continue":
@@ -730,6 +883,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                     leader_id=LEADER_AIC,
                     session_id=state.aip_session_id,
                     user_input=leader_query,
+                    max_polls=dynamic_polls,
                     timeout_seconds=call_timeout,
                 )
             else:
@@ -739,7 +893,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                         leader_id=LEADER_AIC,
                         session_id=state.aip_session_id,
                         task_id=task_id,
-                        max_polls=1,
+                        max_polls=min(2, dynamic_polls),
                         timeout_seconds=call_timeout,
                     )
                 except Exception:
@@ -750,6 +904,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                         leader_id=LEADER_AIC,
                         session_id=state.aip_session_id,
                         user_input=leader_query,
+                        max_polls=dynamic_polls,
                         timeout_seconds=call_timeout,
                     )
                 else:
@@ -760,6 +915,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                         session_id=state.aip_session_id,
                         task_id=task_id,
                         continue_input=leader_query,
+                        max_polls=dynamic_polls,
                         timeout_seconds=call_timeout,
                     )
         elif action == "call_complete":
@@ -789,6 +945,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                     leader_id=LEADER_AIC,
                     session_id=state.aip_session_id,
                     user_input=leader_query,
+                    max_polls=dynamic_polls,
                     timeout_seconds=call_timeout,
                 )
             else:
@@ -797,8 +954,28 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
                     leader_id=LEADER_AIC,
                     session_id=state.aip_session_id,
                     task_id=task_id,
+                    max_polls=dynamic_polls,
                     timeout_seconds=call_timeout,
                 )
+
+        # Stabilize transient processing states to reduce premature "working" returns.
+        transient_state = _normalize_state(str(leader_result.get("final_state", "")))
+        transient_task_id = str(leader_result.get("task_id", "")).strip()
+        if transient_state in {"accepted", "working"} and transient_task_id:
+            remaining_for_stabilize = _remaining_budget(start_total)
+            if remaining_for_stabilize > 1.5:
+                stabilize_start = perf_counter()
+                stabilize_timeout = min(LEADER_CALL_TIMEOUT_SECONDS, remaining_for_stabilize)
+                stabilize_polls = _dynamic_max_polls(remaining_for_stabilize)
+                leader_result = await leader_get_task(
+                    partner_rpc_url=rpc_url,
+                    leader_id=LEADER_AIC,
+                    session_id=state.aip_session_id,
+                    task_id=transient_task_id,
+                    max_polls=stabilize_polls,
+                    timeout_seconds=stabilize_timeout,
+                )
+                timings_ms["leader_stabilize"] = int((perf_counter() - stabilize_start) * 1000)
 
         # Completion gate (demo-leader inspired): for one-shot collaboration we close
         # awaiting-completion tasks immediately unless user explicitly asks to keep pending.
@@ -980,6 +1157,9 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
         leader_result=leader_result,
     )
     SESSION_STATES.save(state)
+    display_state = SessionRuntimeState(**state.__dict__)
+    if not display_state.rpc_url:
+        display_state.rpc_url = rpc_url
     start_post = perf_counter()
     if _remaining_budget(start_total) <= 0:
         return _leader_error_response(
@@ -1020,7 +1200,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
         "memoryTurns": MEMORY.size(chat_key),
         "receivedAt": received_at,
         "collaboration": _collaboration_payload(
-            state,
+            display_state,
             trace=leader_result.get("trace", []),
             phase="post-processed",
             timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},

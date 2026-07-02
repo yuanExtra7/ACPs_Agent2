@@ -24,6 +24,11 @@ class SessionRuntimeState:
     active_task_id: str = ""
     last_state: str = ""
     partner_sender_id: str = ""
+    discovered_partner_aic: str = ""
+    discovered_partner_name: str = ""
+    discovery_query: str = ""
+    discovery_error: str = ""
+    discovery_total_candidates: int = 0
 
 
 class ConversationMemoryStore:
