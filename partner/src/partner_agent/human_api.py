@@ -17,6 +17,7 @@ from .chat_service import (
     is_partner_response_relevant,
     postprocess_collaboration_result,
 )
+from .core.task_execution_manager import TaskExecutionManager
 from .discovery_client import discover_partner_candidate
 from .leader import leader_complete_task, leader_continue_task, leader_get_task, leader_start_task
 from .memory import MEMORY, SESSION_STATES, SessionRuntimeState
@@ -224,6 +225,9 @@ def _collaboration_payload(
     phase: str = "",
     timings_ms: dict[str, int] | None = None,
     retryable: bool = False,
+    execution_status: str = "",
+    execution_phase: str = "",
+    execution_progress: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a normalized collaboration payload for API responses."""
     return {
@@ -243,6 +247,9 @@ def _collaboration_payload(
         "phase": phase,
         "timingsMs": timings_ms or {},
         "retryable": retryable,
+        "executionStatus": execution_status,
+        "executionPhase": execution_phase,
+        "executionProgress": execution_progress or {},
     }
 
 
@@ -317,6 +324,8 @@ def _leader_error_response(
             phase=phase,
             timings_ms=timings_ms,
             retryable=retryable,
+            execution_status="failed",
+            execution_phase="execution_failed",
         ),
     }
 
@@ -427,12 +436,16 @@ async def human_chat_page() -> str:
       color: var(--text);
       display: flex;
       justify-content: center;
-      padding: 24px;
+      padding: clamp(8px, 2.4vw, 24px);
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
     }
     .layout {
-      width: min(1080px, 100%);
-      height: calc(100vh - 48px);
-      min-height: 640px;
+      width: min(1120px, 100%);
+      height: 100%;
+      min-height: 0;
+      max-height: 100%;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 14px;
@@ -445,6 +458,8 @@ async def human_chat_page() -> str:
       border-right: 1px solid var(--line);
       padding: 18px 16px;
       background: #fbfcff;
+      overflow-y: auto;
+      min-width: 0;
     }
     .brand { font-size: 18px; font-weight: 600; margin: 0 0 16px; }
     .meta {
@@ -461,6 +476,7 @@ async def human_chat_page() -> str:
       grid-template-rows: auto 1fr auto;
       height: 100%;
       min-height: 0;
+      min-width: 0;
     }
     .chat-header {
       padding: 16px 20px;
@@ -487,6 +503,7 @@ async def human_chat_page() -> str:
       gap: 12px;
       min-height: 0;
       overscroll-behavior: contain;
+      scrollbar-gutter: stable both-edges;
     }
     .msg { display: flex; width: 100%; }
     .msg.user { justify-content: flex-end; }
@@ -507,6 +524,25 @@ async def human_chat_page() -> str:
       color: var(--text);
       border-color: var(--line);
     }
+    .msg.agent .bubble.pending {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #4f5f78;
+    }
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid #d6deed;
+      border-top-color: #4f7cff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex: 0 0 auto;
+    }
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
     .msg-time {
       margin-top: 4px;
       font-size: 11px;
@@ -520,11 +556,15 @@ async def human_chat_page() -> str:
       grid-template-columns: 1fr auto;
       gap: 10px;
       background: #fff;
+      position: sticky;
+      bottom: 0;
+      z-index: 2;
     }
+    .composer-main { min-width: 0; }
     textarea {
-      resize: vertical;
-      min-height: 120px;
-      max-height: 260px;
+      resize: none;
+      min-height: 88px;
+      max-height: 180px;
       border: 1px solid var(--line);
       border-radius: 10px;
       padding: 12px 14px;
@@ -532,6 +572,8 @@ async def human_chat_page() -> str:
       font-family: inherit;
       outline: none;
       width: 100%;
+      line-height: 1.5;
+      overflow-y: auto;
     }
     textarea:focus { border-color: #9cb6ff; box-shadow: 0 0 0 3px #edf2ff; }
     button {
@@ -556,6 +598,35 @@ async def human_chat_page() -> str:
       font-size: 12px;
       color: var(--subtext);
       line-height: 1.6;
+    }
+    @media (max-width: 960px) {
+      body { padding: 0; }
+      .layout {
+        width: 100%;
+        height: 100%;
+        border-radius: 0;
+        border: none;
+        box-shadow: none;
+        grid-template-columns: 1fr;
+      }
+      .sidebar {
+        border-right: none;
+        border-bottom: 1px solid var(--line);
+        max-height: 36vh;
+      }
+      .messages { padding: 14px; }
+      .chat-header { padding: 12px 14px; }
+      .composer { padding: 10px 12px; }
+    }
+    @media (max-width: 640px) {
+      .composer {
+        grid-template-columns: 1fr;
+      }
+      button {
+        width: 100%;
+        height: 40px;
+      }
+      .bubble, .msg.user .bubble { max-width: 100%; }
     }
   </style>
 </head>
@@ -598,7 +669,7 @@ async def human_chat_page() -> str:
       </header>
       <section id="messages" class="messages"></section>
       <footer class="composer">
-        <div>
+        <div class="composer-main">
           <textarea id="input" placeholder="请输入问题，按 Enter 发送（Shift+Enter 换行）"></textarea>
           <div class="hint">已启用服务端会话记忆（进程内存，服务重启后会清空）。</div>
         </div>
@@ -612,6 +683,10 @@ async def human_chat_page() -> str:
     const sendBtn = document.getElementById("sendBtn");
     const rpcUrlEl = document.getElementById("rpcUrl");
     const runtimeInfoEl = document.getElementById("runtimeInfo");
+    let pendingBubbleEl = null;
+    let pendingPolling = false;
+    let isComposing = false;
+    const MAX_PENDING_POLLS = 30;
     const sessionId = (window.crypto && crypto.randomUUID)
       ? crypto.randomUUID()
       : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -637,12 +712,85 @@ async def human_chat_page() -> str:
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
+    function autoResizeTextarea() {
+      inputEl.style.height = "auto";
+      const target = Math.min(180, Math.max(88, inputEl.scrollHeight));
+      inputEl.style.height = `${target}px`;
+    }
+
+    function appendPendingMessage(text) {
+      removePendingMessage();
+      const row = document.createElement("div");
+      row.className = "msg agent";
+      const bubbleWrap = document.createElement("div");
+      const bubble = document.createElement("div");
+      bubble.className = "bubble pending";
+      const spinner = document.createElement("span");
+      spinner.className = "spinner";
+      const label = document.createElement("span");
+      label.textContent = text || "正在等待远端智能体处理...";
+      bubble.appendChild(spinner);
+      bubble.appendChild(label);
+      bubbleWrap.appendChild(bubble);
+      row.appendChild(bubbleWrap);
+      messagesEl.appendChild(row);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      pendingBubbleEl = row;
+    }
+
+    function removePendingMessage() {
+      if (pendingBubbleEl && pendingBubbleEl.parentNode) {
+        pendingBubbleEl.parentNode.removeChild(pendingBubbleEl);
+      }
+      pendingBubbleEl = null;
+    }
+
+    async function pollUntilRemoteReady(text, rpcUrl) {
+      pendingPolling = true;
+      let pollCount = 0;
+      while (pendingPolling && pollCount < MAX_PENDING_POLLS) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        pollCount += 1;
+        const resp = await fetch("/human/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text,
+            session_id: sessionId,
+            rpc_url: rpcUrl || null
+          })
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        renderRuntimeInfo(data);
+        if (data.mode === "leader-pending") {
+          continue;
+        }
+        removePendingMessage();
+        appendMessage("agent", data.answer || "未返回有效回复");
+        sendBtn.disabled = false;
+        inputEl.focus();
+        pendingPolling = false;
+        return;
+      }
+      removePendingMessage();
+      appendMessage("agent", "远端仍在处理中，请稍后再试或再次发送问题继续查询。");
+      sendBtn.disabled = false;
+      inputEl.focus();
+      pendingPolling = false;
+    }
+
     function renderRuntimeInfo(data) {
       const collab = data.collaboration || {};
       const mode = data.mode || "-";
       const taskId = collab.taskId || "-";
       const state = collab.state || "-";
       const phase = collab.phase || "-";
+      const execStatus = collab.executionStatus || "-";
+      const execPhase = collab.executionPhase || "-";
+      const execProgress = collab.executionProgress || {};
+      const pollRounds = execProgress.pollRounds ?? "-";
+      const traceSteps = execProgress.traceSteps ?? "-";
       const rpc = collab.effectiveRpcUrl || "-";
       const agentAic = collab.partnerSenderId || collab.discoveredAgentAic || "-";
       const agentName = collab.discoveredAgentName || "-";
@@ -654,40 +802,57 @@ async def human_chat_page() -> str:
       const timings = collab.timingsMs || {};
       const timingText = Object.entries(timings).map(([k, v]) => `${k}:${v}ms`).join(", ") || "-";
       const agentText = agentName !== "-" ? `${agentName} (${agentAic})` : (agentAic !== "-" ? agentAic : "-");
-      runtimeInfoEl.innerHTML = `mode: ${mode}<br/>task: ${taskId}<br/>state: ${state}<br/>phase: ${phase}<br/>rpc: ${rpc}<br/>agent: ${agentText}<br/>discovery: q=${discoveryQuery}; candidates=${discoveryCandidates}; err=${discoveryError}<br/>timings: ${timingText}<br/>recovery: ${recoveryHint}<br/>error: ${error}`;
+      runtimeInfoEl.innerHTML = `mode: ${mode}<br/>task: ${taskId}<br/>state: ${state}<br/>phase: ${phase}<br/>exec: status=${execStatus}; phase=${execPhase}; poll=${pollRounds}; trace=${traceSteps}<br/>rpc: ${rpc}<br/>agent: ${agentText}<br/>discovery: q=${discoveryQuery}; candidates=${discoveryCandidates}; err=${discoveryError}<br/>timings: ${timingText}<br/>recovery: ${recoveryHint}<br/>error: ${error}`;
     }
 
     async function sendMessage() {
       const text = inputEl.value.trim();
       if (!text) return;
+      if (pendingPolling) return;
       inputEl.value = "";
+      autoResizeTextarea();
       appendMessage("user", text);
       sendBtn.disabled = true;
       runtimeInfoEl.innerHTML = "mode: pending<br/>task: -<br/>state: -<br/>phase: calling<br/>rpc: -<br/>agent: -<br/>discovery: -<br/>timings: -<br/>recovery: -<br/>error: -";
+      appendPendingMessage("正在调用远端智能体，请稍候...");
       try {
+        const rpcInput = (rpcUrlEl.value || "").trim();
         const resp = await fetch("/human/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             text,
             session_id: sessionId,
-            rpc_url: (rpcUrlEl.value || "").trim() || null
+            rpc_url: rpcInput || null
           })
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
-        appendMessage("agent", data.answer || "未返回有效回复");
         renderRuntimeInfo(data);
+        if (data.mode === "leader-pending") {
+          await pollUntilRemoteReady(text, rpcInput);
+          return;
+        }
+        removePendingMessage();
+        appendMessage("agent", data.answer || "未返回有效回复");
       } catch (err) {
+        removePendingMessage();
         appendMessage("agent", `请求失败：${err.message}`);
-      } finally {
         sendBtn.disabled = false;
         inputEl.focus();
+        pendingPolling = false;
+        return;
       }
+      sendBtn.disabled = false;
+      inputEl.focus();
     }
 
     sendBtn.addEventListener("click", sendMessage);
+    inputEl.addEventListener("input", autoResizeTextarea);
+    inputEl.addEventListener("compositionstart", () => { isComposing = true; });
+    inputEl.addEventListener("compositionend", () => { isComposing = false; });
     inputEl.addEventListener("keydown", (e) => {
+      if ((e.isComposing || isComposing) && e.key === "Enter") return;
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
@@ -695,6 +860,7 @@ async def human_chat_page() -> str:
     });
 
     appendMessage("agent", "你好，我是文本咨询智能体。请直接输入你的问题。");
+    autoResizeTextarea();
     inputEl.focus();
   </script>
 </body>
@@ -750,15 +916,20 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
             retryable=True,
         )
 
-    start_router = perf_counter()
-    decision = await decide_human_action(
-        text,
-        router_history_key=router_key,
-        candidate_rpc_url=rpc_url or None,
-        has_active_task=bool(state.active_task_id),
-        active_task_state=state.last_state,
-    )
-    timings_ms["routing"] = int((perf_counter() - start_router) * 1000)
+    if HUMAN_FORCE_REMOTE_COLLAB:
+        # Force-remote mode bypasses LLM routing to save budget and reduce variance.
+        decision = {"action": "call_start", "query": _remove_url(text, rpc_url).strip() or text}
+        timings_ms["routing"] = 0
+    else:
+        start_router = perf_counter()
+        decision = await decide_human_action(
+            text,
+            router_history_key=router_key,
+            candidate_rpc_url=rpc_url or None,
+            has_active_task=bool(state.active_task_id),
+            active_task_state=state.last_state,
+        )
+        timings_ms["routing"] = int((perf_counter() - start_router) * 1000)
     action = decision.get("action", "local_reply")
     action, reset_stale_task = _resolve_action_for_awaiting_completion(state=state, action=action, text=text)
     if reset_stale_task:
@@ -766,9 +937,14 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
         state.last_state = ""
     if HUMAN_FORCE_REMOTE_COLLAB:
         # Product requirement: every user turn should invoke remote collaboration.
-        action = "call_start"
-        state.active_task_id = ""
-        state.last_state = ""
+        # If there is an in-flight remote task, poll it first; otherwise start a new task.
+        normalized_last_state = _normalize_state(state.last_state)
+        if state.active_task_id and normalized_last_state in {"accepted", "working"}:
+            action = "call_get"
+        else:
+            action = "call_start"
+            state.active_task_id = ""
+            state.last_state = ""
     if (
         action == "local_reply"
         and AUTO_DISCOVERY_ENABLED
@@ -820,6 +996,23 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
             state.discovery_error = discover_error
 
     if action == "need_rpc_url":
+        if not payload_rpc and not extracted_rpc and state.discovery_error:
+            answer = await build_chat_answer(text, conversation_key=chat_key)
+            SESSION_STATES.save(state)
+            display_state = _display_state_for_local_reply(state)
+            return {
+                "answer": answer,
+                "mode": "local-fallback",
+                "sessionId": session_id,
+                "memoryTurns": MEMORY.size(chat_key),
+                "receivedAt": received_at,
+                "collaboration": _collaboration_payload(
+                    display_state,
+                    phase="discover-fallback-local",
+                    recovery_hint="自动发现失败，已降级本地回复。",
+                    timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
+                ),
+            }
         answer = "请提供可访问的 RPC 地址（http(s)://.../rpc），我才能发起真实调用。"
         if state.discovery_error:
             answer = f"{answer} 自动发现失败：{state.discovery_error}"
@@ -838,6 +1031,23 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
         }
 
     if not rpc_url:
+        if not payload_rpc and not extracted_rpc and state.discovery_error:
+            answer = await build_chat_answer(text, conversation_key=chat_key)
+            SESSION_STATES.save(state)
+            display_state = _display_state_for_local_reply(state)
+            return {
+                "answer": answer,
+                "mode": "local-fallback",
+                "sessionId": session_id,
+                "memoryTurns": MEMORY.size(chat_key),
+                "receivedAt": received_at,
+                "collaboration": _collaboration_payload(
+                    display_state,
+                    phase="discover-fallback-local",
+                    recovery_hint="自动发现失败，已降级本地回复。",
+                    timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
+                ),
+            }
         answer = "当前没有可用 RPC 地址，请在左侧填写或在消息中提供 http(s)://.../rpc。"
         if state.discovery_error:
             answer = f"{answer} 自动发现失败：{state.discovery_error}"
@@ -855,166 +1065,42 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
             ),
         }
 
-    start_leader = perf_counter()
-    try:
-        remaining_before_leader = _remaining_budget(start_total)
-        if remaining_before_leader <= 0:
-            raise TimeoutError("end-to-end budget exhausted before leader call")
-        call_timeout = min(LEADER_CALL_TIMEOUT_SECONDS, remaining_before_leader)
-        dynamic_polls = _dynamic_max_polls(remaining_before_leader)
-
-        if action == "call_start":
-            leader_query = (decision.get("query") or "").strip() or _remove_url(text, rpc_url).strip() or text
-            leader_result = await leader_start_task(
-                partner_rpc_url=rpc_url,
-                leader_id=LEADER_AIC,
-                session_id=state.aip_session_id,
-                user_input=leader_query,
-                task_id=None,
-                max_polls=dynamic_polls,
-                timeout_seconds=call_timeout,
-            )
-        elif action == "call_continue":
-            task_id = state.active_task_id
-            if not task_id:
-                leader_query = (decision.get("query") or "").strip() or text
-                leader_result = await leader_start_task(
-                    partner_rpc_url=rpc_url,
-                    leader_id=LEADER_AIC,
-                    session_id=state.aip_session_id,
-                    user_input=leader_query,
-                    max_polls=dynamic_polls,
-                    timeout_seconds=call_timeout,
-                )
-            else:
-                try:
-                    await leader_get_task(
-                        partner_rpc_url=rpc_url,
-                        leader_id=LEADER_AIC,
-                        session_id=state.aip_session_id,
-                        task_id=task_id,
-                        max_polls=min(2, dynamic_polls),
-                        timeout_seconds=call_timeout,
-                    )
-                except Exception:
-                    state = _rebuild_session_state(state)
-                    leader_query = (decision.get("query") or "").strip() or text
-                    leader_result = await leader_start_task(
-                        partner_rpc_url=rpc_url,
-                        leader_id=LEADER_AIC,
-                        session_id=state.aip_session_id,
-                        user_input=leader_query,
-                        max_polls=dynamic_polls,
-                        timeout_seconds=call_timeout,
-                    )
-                else:
-                    leader_query = (decision.get("query") or "").strip() or text
-                    leader_result = await leader_continue_task(
-                        partner_rpc_url=rpc_url,
-                        leader_id=LEADER_AIC,
-                        session_id=state.aip_session_id,
-                        task_id=task_id,
-                        continue_input=leader_query,
-                        max_polls=dynamic_polls,
-                        timeout_seconds=call_timeout,
-                    )
-        elif action == "call_complete":
-            task_id = state.active_task_id
-            if not task_id:
-                SESSION_STATES.save(state)
-                return _leader_error_response(
-                    state=state,
-                    session_id=session_id,
-                    answer="当前没有待完成任务，建议先发起协作或重建任务。",
-                    memory_turns=MEMORY.size(chat_key),
-                    recovery_hint="请先给出协作问题以创建任务。",
-                )
-            leader_result = await leader_complete_task(
-                partner_rpc_url=rpc_url,
-                leader_id=LEADER_AIC,
-                session_id=state.aip_session_id,
-                task_id=task_id,
-                timeout_seconds=call_timeout,
-            )
-        else:  # call_get
-            task_id = state.active_task_id
-            if not task_id:
-                leader_query = (decision.get("query") or "").strip() or text
-                leader_result = await leader_start_task(
-                    partner_rpc_url=rpc_url,
-                    leader_id=LEADER_AIC,
-                    session_id=state.aip_session_id,
-                    user_input=leader_query,
-                    max_polls=dynamic_polls,
-                    timeout_seconds=call_timeout,
-                )
-            else:
-                leader_result = await leader_get_task(
-                    partner_rpc_url=rpc_url,
-                    leader_id=LEADER_AIC,
-                    session_id=state.aip_session_id,
-                    task_id=task_id,
-                    max_polls=dynamic_polls,
-                    timeout_seconds=call_timeout,
-                )
-
-        # Stabilize transient processing states to reduce premature "working" returns.
-        transient_state = _normalize_state(str(leader_result.get("final_state", "")))
-        transient_task_id = str(leader_result.get("task_id", "")).strip()
-        if transient_state in {"accepted", "working"} and transient_task_id:
-            remaining_for_stabilize = _remaining_budget(start_total)
-            if remaining_for_stabilize > 1.5:
-                stabilize_start = perf_counter()
-                stabilize_timeout = min(LEADER_CALL_TIMEOUT_SECONDS, remaining_for_stabilize)
-                stabilize_polls = _dynamic_max_polls(remaining_for_stabilize)
-                leader_result = await leader_get_task(
-                    partner_rpc_url=rpc_url,
-                    leader_id=LEADER_AIC,
-                    session_id=state.aip_session_id,
-                    task_id=transient_task_id,
-                    max_polls=stabilize_polls,
-                    timeout_seconds=stabilize_timeout,
-                )
-                timings_ms["leader_stabilize"] = int((perf_counter() - stabilize_start) * 1000)
-
-        # Completion gate (demo-leader inspired): for one-shot collaboration we close
-        # awaiting-completion tasks immediately unless user explicitly asks to keep pending.
-        final_state = _normalize_state(str(leader_result.get("final_state", "")))
-        initial_proof = leader_result.get("call_proof") or _call_proof_for_failure(
+    if action == "call_complete" and not state.active_task_id:
+        SESSION_STATES.save(state)
+        return _leader_error_response(
             state=state,
-            reason="pre-complete-missing-proof",
+            session_id=session_id,
+            answer="当前没有待完成任务，建议先发起协作或重建任务。",
+            memory_turns=MEMORY.size(chat_key),
+            recovery_hint="请先给出协作问题以创建任务。",
         )
-        if (
-            final_state == "awaiting-completion"
-            and action != "call_complete"
-            and _proof_allows_remote_claim(initial_proof)
-        ):
-            remaining_before_complete = _remaining_budget(start_total)
-            if remaining_before_complete > 1.0:
-                complete_timeout = min(LEADER_CALL_TIMEOUT_SECONDS, remaining_before_complete)
-                complete_start = perf_counter()
-                complete_task_id = str(leader_result.get("task_id", "")).strip()
-                if complete_task_id:
-                    complete_result = await leader_complete_task(
-                        partner_rpc_url=rpc_url,
-                        leader_id=LEADER_AIC,
-                        session_id=state.aip_session_id,
-                        task_id=complete_task_id,
-                        timeout_seconds=complete_timeout,
-                    )
-                    combined_trace = [
-                        *(leader_result.get("trace", []) or []),
-                        *(complete_result.get("trace", []) or []),
-                    ]
-                    if not complete_result.get("product_texts"):
-                        complete_result["product_texts"] = leader_result.get("product_texts", [])
-                    if not complete_result.get("status_texts"):
-                        complete_result["status_texts"] = leader_result.get("status_texts", [])
-                    if not complete_result.get("call_proof"):
-                        complete_result["call_proof"] = leader_result.get("call_proof", {})
-                    complete_result["trace"] = combined_trace
-                    leader_result = complete_result
-                    timings_ms["leader_complete"] = int((perf_counter() - complete_start) * 1000)
+
+    start_leader = perf_counter()
+    execution_manager = TaskExecutionManager(
+        leader_id=LEADER_AIC,
+        leader_call_timeout_seconds=LEADER_CALL_TIMEOUT_SECONDS,
+        normalize_state=_normalize_state,
+        remaining_budget=_remaining_budget,
+        dynamic_max_polls=_dynamic_max_polls,
+        proof_allows_remote_claim=_proof_allows_remote_claim,
+        call_proof_for_failure=_call_proof_for_failure,
+        leader_start_task=leader_start_task,
+        leader_get_task=leader_get_task,
+        leader_continue_task=leader_continue_task,
+        leader_complete_task=leader_complete_task,
+    )
+    try:
+        execution = await execution_manager.execute(
+            action=action,
+            decision_query=(decision.get("query") or "").strip() or _remove_url(text, rpc_url).strip() or text,
+            text=text,
+            rpc_url=rpc_url,
+            state=state,
+            start_total=start_total,
+            timings_ms=timings_ms,
+        )
+        leader_result = execution.leader_result
+        timings_ms = execution.timings_ms
     except Exception as exc:
         timings_ms["leader"] = int((perf_counter() - start_leader) * 1000)
         state = _rebuild_session_state(state)
@@ -1031,7 +1117,7 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
             phase=phase,
             timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
         )
-    timings_ms["leader"] = int((perf_counter() - start_leader) * 1000)
+    timings_ms.setdefault("leader", int((perf_counter() - start_leader) * 1000))
 
     if not _leader_binding_ok(state=state, leader_result=leader_result):
         state = _rebuild_session_state(state)
@@ -1064,6 +1150,39 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
         )
 
     raw_partner_answer = _resolve_answer_from_leader(leader_result)
+    final_state_normalized = _normalize_state(str(leader_result.get("final_state", "")))
+    if final_state_normalized in {"accepted", "working"}:
+        # Keep request pending and let frontend poll, instead of returning
+        # a fragmented local fallback while remote task is still in progress.
+        state = _merge_session_state(
+            state,
+            rpc_url=rpc_url,
+            aip_session_id=state.aip_session_id,
+            leader_result=leader_result,
+        )
+        SESSION_STATES.save(state)
+        display_state = SessionRuntimeState(**state.__dict__)
+        if not display_state.rpc_url:
+            display_state.rpc_url = rpc_url
+        timings_ms["postprocess"] = 0
+        return {
+            "answer": "",
+            "mode": "leader-pending",
+            "sessionId": session_id,
+            "memoryTurns": MEMORY.size(chat_key),
+            "receivedAt": received_at,
+            "collaboration": _collaboration_payload(
+                display_state,
+                trace=leader_result.get("trace", []),
+                phase="remote-pending",
+                recovery_hint="远端处理中，前端将自动轮询直到完成。",
+                timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
+                execution_status="running",
+                execution_phase="execution_polling",
+                execution_progress=leader_result.get("execution_progress") or {},
+            ),
+        }
+
     remaining_for_relevance = _remaining_budget(start_total)
     if remaining_for_relevance > 1.0:
         relevant = await is_partner_response_relevant(
@@ -1162,16 +1281,38 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
         display_state.rpc_url = rpc_url
     start_post = perf_counter()
     if _remaining_budget(start_total) <= 0:
-        return _leader_error_response(
-            state=state,
-            session_id=session_id,
-            answer="协作进入后处理前已超时，请重试。",
-            memory_turns=MEMORY.size(chat_key),
-            recovery_hint="可缩短问题或稍后重试。",
-            error="postprocess-budget-timeout",
-            phase="timeout",
-            timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
-        )
+        timings_ms["postprocess"] = 0
+        answer = raw_partner_answer or "协作已执行，当前任务状态：working"
+        appended = _append_chat_exchange_if_new(chat_key, text, answer)
+        if not appended:
+            state = _rebuild_session_state(state)
+            SESSION_STATES.save(state)
+            return _leader_error_response(
+                state=state,
+                session_id=session_id,
+                answer="检测到重复结果写回，已自动重建任务状态，请重试。",
+                memory_turns=MEMORY.size(chat_key),
+                recovery_hint="请重发你的请求，系统会创建新任务。",
+                error="duplicate-stale-answer-detected",
+                timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
+            )
+        return {
+            "answer": answer,
+            "mode": "leader-proxy",
+            "sessionId": session_id,
+            "memoryTurns": MEMORY.size(chat_key),
+            "receivedAt": received_at,
+            "collaboration": _collaboration_payload(
+                display_state,
+                trace=leader_result.get("trace", []),
+                phase="postprocess-degraded",
+                recovery_hint="已返回远端原始结果（后处理预算不足）。",
+                timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
+                execution_status="completed",
+                execution_phase="aggregation_completed",
+                execution_progress=leader_result.get("execution_progress") or {},
+            ),
+        }
     answer = await postprocess_collaboration_result(
         user_request=text,
         partner_response=raw_partner_answer,
@@ -1204,5 +1345,8 @@ async def human_chat(payload: HumanChatRequest) -> dict[str, object]:
             trace=leader_result.get("trace", []),
             phase="post-processed",
             timings_ms={**timings_ms, "total": int((perf_counter() - start_total) * 1000)},
+            execution_status="completed",
+            execution_phase="aggregation_completed",
+            execution_progress=leader_result.get("execution_progress") or {},
         ),
     }

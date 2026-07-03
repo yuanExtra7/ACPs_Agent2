@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Literal
 
@@ -11,6 +12,7 @@ from .memory import MEMORY
 from .settings import POSTPROCESS_WITH_LLM
 
 _BRAIN = DeepSeekChatBrain()
+logger = logging.getLogger(__name__)
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 ROUTER_TIMEOUT_SECONDS = 8.0
 POSTPROCESS_TIMEOUT_SECONDS = 12.0
@@ -32,8 +34,15 @@ RouterAction = Literal[
 
 
 def fallback_answer(user_text: str) -> str:
-    """Return a deterministic fallback message when model calls are unavailable."""
-    return f"已收到文本咨询：{user_text}"
+    """Return a clear diagnostic fallback when model calls are unavailable."""
+    _ = user_text  # keep signature stable for existing callers
+    return "当前本地模型暂不可用，无法生成有效咨询回答。请检查 DEEPSEEK_BASE_URL / DEEPSEEK_API_KEY 后重试。"
+
+
+def _fallback_answer_with_error(error: Exception) -> str:
+    """Return actionable diagnostics when model invocation fails."""
+    detail = str(error).strip() or error.__class__.__name__
+    return f"LLM调用失败（{detail}）。请检查模型服务可达性、密钥权限与超时配置后重试。"
 
 
 def _extract_json_object(text: str) -> dict[str, object]:
@@ -266,8 +275,9 @@ async def build_chat_answer(
             if conversation_key:
                 MEMORY.append_exchange(conversation_key, text, answer)
             return answer
-        except Exception:
-            answer = fallback_answer(text)
+        except Exception as exc:
+            logger.exception("LLM chat failed in build_chat_answer")
+            answer = _fallback_answer_with_error(exc)
             if conversation_key:
                 MEMORY.append_exchange(conversation_key, text, answer)
             return answer

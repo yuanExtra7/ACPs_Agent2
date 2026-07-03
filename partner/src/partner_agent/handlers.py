@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from acps_sdk.aip.aip_base_model import Product, TaskCommand, TaskResult, TaskState, TextDataItem
 from acps_sdk.aip.aip_rpc_server import TaskManager
 
@@ -16,8 +18,17 @@ TERMINAL_STATES = {
 }
 CONTINUE_ALLOWED_STATES = {
     TaskState.AwaitingInput,
-    TaskState.AwaitingCompletion,
 }
+_TASK_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _task_lock(task_id: str) -> asyncio.Lock:
+    """Return a per-task lock to serialize in-memory task mutations."""
+    lock = _TASK_LOCKS.get(task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _TASK_LOCKS[task_id] = lock
+    return lock
 def _text_from(command: TaskCommand) -> str:
     """Extract the first text data item from a command."""
     for item in command.dataItems or []:
@@ -82,52 +93,96 @@ def _is_terminal(task: TaskResult) -> bool:
 def _conversation_key(command: TaskCommand) -> str:
     """Build the chat-memory key used by the model layer."""
     session = command.sessionId or command.taskId
-    return f"partner:{session}"
+    task = command.taskId or "unknown-task"
+    return f"partner:{session}:{task}"
 
 
 async def on_start(command: TaskCommand, task: TaskResult | None) -> TaskResult:
     """Handle start command and move task into AwaitingCompletion when ready."""
-    if task:
-        return _with_sender(task)
+    async with _task_lock(command.taskId):
+        if task:
+            return _with_sender(task)
 
-    if _contains_non_text_data(command):
-        return _reject_non_text_request(command)
+        if _contains_non_text_data(command):
+            return _reject_non_text_request(command)
 
-    user_text = _text_from(command).strip()
-    if not user_text:
-        return _ask_for_text_input(command)
+        user_text = _text_from(command).strip()
+        if not user_text:
+            return _ask_for_text_input(command)
 
-    answer = await build_chat_answer(user_text, conversation_key=_conversation_key(command))
+        task = TaskManager.create_task(
+            command,
+            initial_state=TaskState.Working,
+            data_items=[TextDataItem(text="正在处理你的请求，请稍候。")],
+        )
+        try:
+            answer = await build_chat_answer(user_text, conversation_key=_conversation_key(command))
+        except Exception as exc:
+            failed = TaskManager.update_task_status(
+                task.taskId,
+                TaskState.Failed,
+                data_items=[TextDataItem(text=f"处理失败：{exc}")],
+            )
+            return _with_sender(failed or TaskManager.get_task(task.taskId) or task)
 
-    task = TaskManager.create_task(command, initial_state=TaskState.AwaitingCompletion)
-    _set_chat_product(task.taskId, answer)
-    return _with_sender(TaskManager.get_task(task.taskId) or task)
+        _set_chat_product(task.taskId, answer)
+        updated = TaskManager.update_task_status(task.taskId, TaskState.AwaitingCompletion)
+        return _with_sender(updated or TaskManager.get_task(task.taskId) or task)
 
 
 async def on_continue(command: TaskCommand, task: TaskResult) -> TaskResult:
     """Handle continue command with idempotent behavior outside allowed states."""
-    # Keep continue idempotent outside allowed states.
-    if _is_terminal(task) or task.status.state not in CONTINUE_ALLOWED_STATES:
+    async with _task_lock(task.taskId):
+        # Keep continue idempotent outside allowed states.
+        if _is_terminal(task) or task.status.state not in CONTINUE_ALLOWED_STATES:
+            TaskManager.add_command_to_history(task.taskId, command)
+            return _with_sender(task)
+
         TaskManager.add_command_to_history(task.taskId, command)
-        return _with_sender(task)
 
-    TaskManager.add_command_to_history(task.taskId, command)
+        if _contains_non_text_data(command):
+            TaskManager.update_task_status(
+                task.taskId,
+                TaskState.AwaitingInput,
+                data_items=[TextDataItem(text="仅支持文本补充信息，请改为纯文本。")],
+            )
+            return _with_sender(TaskManager.get_task(task.taskId) or task)
 
-    if _contains_non_text_data(command):
+        user_text = _text_from(command).strip()
+        if not user_text:
+            return _with_sender(task)
+
         TaskManager.update_task_status(
             task.taskId,
-            TaskState.AwaitingInput,
-            data_items=[TextDataItem(text="仅支持文本补充信息，请改为纯文本。")],
+            TaskState.Working,
+            data_items=[TextDataItem(text="正在处理补充信息，请稍候。")],
         )
-        return _with_sender(TaskManager.get_task(task.taskId) or task)
+        try:
+            answer = await build_chat_answer(user_text, conversation_key=_conversation_key(command))
+        except Exception as exc:
+            failed = TaskManager.update_task_status(
+                task.taskId,
+                TaskState.Failed,
+                data_items=[TextDataItem(text=f"补充处理失败：{exc}")],
+            )
+            return _with_sender(failed or TaskManager.get_task(task.taskId) or task)
 
-    user_text = _text_from(command).strip()
-    if not user_text:
-        return _with_sender(task)
+        _set_chat_product(task.taskId, answer)
+        updated = TaskManager.update_task_status(task.taskId, TaskState.AwaitingCompletion)
+        return _with_sender(updated or TaskManager.get_task(task.taskId) or task)
 
-    answer = await build_chat_answer(user_text, conversation_key=_conversation_key(command))
 
-    _set_chat_product(task.taskId, answer)
-    updated = TaskManager.update_task_status(task.taskId, TaskState.AwaitingCompletion)
-    return _with_sender(updated)
+async def on_complete(command: TaskCommand, task: TaskResult) -> TaskResult:
+    """Handle complete command with strict state boundary and idempotency."""
+    async with _task_lock(task.taskId):
+        TaskManager.add_command_to_history(task.taskId, command)
+        if _is_terminal(task):
+            return _with_sender(task)
+
+        if task.status.state != TaskState.AwaitingCompletion:
+            # Only AwaitingCompletion can transition to Completed.
+            return _with_sender(TaskManager.get_task(task.taskId) or task)
+
+        updated = TaskManager.update_task_status(task.taskId, TaskState.Completed)
+        return _with_sender(updated or TaskManager.get_task(task.taskId) or task)
 

@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from partner_agent import human_api
+from partner_agent.core.task_execution_manager import ExecutionResult
 from partner_agent.app import app
 from partner_agent.memory import SESSION_STATES
 
@@ -411,6 +412,86 @@ def test_force_remote_collaboration_always_calls_start(monkeypatch) -> None:
     assert len(starts) == 2
 
 
+def test_discovery_failure_falls_back_to_local_answer(monkeypatch) -> None:
+    _reset_session("discover-fallback-1")
+    monkeypatch.setattr(human_api, "HUMAN_FORCE_REMOTE_COLLAB", True)
+    monkeypatch.setattr(human_api, "AUTO_DISCOVERY_ENABLED", True)
+
+    async def _fake_decision(
+        _: str,
+        *,
+        router_history_key: str,
+        candidate_rpc_url: str | None,
+        has_active_task: bool,
+        active_task_state: str,
+    ):
+        return {"action": "call_start", "query": "向我介绍csgo"}
+
+    async def _fake_auto_discovery(*, text: str, decision_query: str, state):
+        state.discovery_query = decision_query
+        state.discovery_error = "discover returned no callable endpoint"
+        state.discovery_total_candidates = 0
+        return "", "discover returned no callable endpoint"
+
+    async def _fake_local_answer(_: str, *, conversation_key: str | None = None) -> str:
+        return "这是本地知识回复（discover失败降级）。"
+
+    monkeypatch.setattr(human_api, "decide_human_action", _fake_decision)
+    monkeypatch.setattr(human_api, "_try_auto_discovery", _fake_auto_discovery)
+    monkeypatch.setattr(human_api, "build_chat_answer", _fake_local_answer)
+
+    client = TestClient(app)
+    response = client.post(
+        "/human/chat",
+        json={"text": "现在我希望你找其它智能体介绍csgo", "session_id": "discover-fallback-1"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "local-fallback"
+    assert data["answer"] == "这是本地知识回复（discover失败降级）。"
+    assert data["collaboration"]["phase"] == "discover-fallback-local"
+
+
+def test_working_state_returns_pending_mode_without_raw_working_answer(monkeypatch) -> None:
+    _reset_session("working-fallback-1")
+    monkeypatch.setattr(human_api, "HUMAN_FORCE_REMOTE_COLLAB", True)
+
+    class _FakeExecutionManager:
+        def __init__(self, **kwargs):
+            pass
+
+        async def execute(self, **kwargs):
+            return ExecutionResult(
+                leader_result={
+                    "final_state": "working",
+                    "task_id": "task-working-1",
+                    "partner_sender_id": "partner-a",
+                    "binding_ok": True,
+                    "product_texts": [],
+                    "status_texts": ["协作已执行，当前任务状态：working"],
+                    "trace": [{"step": "start"}],
+                    "call_proof": {"invoked": True, "trace_steps": ["start"]},
+                },
+                timings_ms=kwargs["timings_ms"],
+            )
+
+    monkeypatch.setattr(human_api, "TaskExecutionManager", _FakeExecutionManager)
+    monkeypatch.setattr(human_api, "decide_human_action", lambda *args, **kwargs: {"action": "call_start", "query": "q"})
+
+    client = TestClient(app)
+    response = client.post(
+        "/human/chat",
+        json={"text": "向我介绍英伟达股价", "session_id": "working-fallback-1", "rpc_url": "https://www.ioa.pub/api/finance/aip"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "leader-pending"
+    assert data["collaboration"]["phase"] == "remote-pending"
+    assert data["collaboration"]["executionStatus"] == "running"
+    assert data["collaboration"]["executionPhase"] == "execution_polling"
+    assert data["answer"] == ""
+
+
 def test_local_reply_hides_stale_remote_runtime_info(monkeypatch) -> None:
     SESSION_STATES.update(
         "local-clear-1",
@@ -790,6 +871,8 @@ def test_collaboration_result_uses_model_postprocess(monkeypatch) -> None:
     assert data["mode"] == "leader-proxy"
     assert data["answer"] == "按用户要求整合后的交付"
     assert data["collaboration"]["phase"] == "post-processed"
+    assert data["collaboration"]["executionStatus"] == "completed"
+    assert data["collaboration"]["executionPhase"] == "aggregation_completed"
     assert "routing" in data["collaboration"]["timingsMs"]
     assert "leader" in data["collaboration"]["timingsMs"]
     assert "postprocess" in data["collaboration"]["timingsMs"]
