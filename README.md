@@ -1,6 +1,6 @@
 # Agent_：基于 ACPs 的互联智能体初版工程
 
-本项目是一个基于 `ACPs-community` 实现的智能体原型，当前以 **Direct RPC 模式** 为主，完成了可运行的 Partner 能力、Leader 代理能力和 Human 对话入口，并已进入 **ATR 注册审核等待阶段**。
+本项目是一个基于 `ACPs-community` 实现的智能体原型，当前以 **Direct RPC 模式** 为主，完成了可运行的 Partner 能力、Leader 代理能力和 Human 对话入口，并已完成平台注册、发现与互联调用链路验证。
 
 项目定位不是完整生产平台，而是一个可验证、可扩展、可逐步演进的 ACPs 智能体工程底座。
 
@@ -15,7 +15,7 @@
 - 支持两类使用方式：
   - 作为 Partner，被外部 Leader 通过 `/rpc` 调用；
   - 作为简化 Leader，主动代理调用远端 Partner。
-- 完成可信注册所需材料准备（ACS、CLI 配置、脚本），并推进到审核流程。
+- 完成可信注册所需材料准备（ACS、CLI 配置、脚本）并打通注册/证书流程。
 
 ### 1.2 当前边界
 
@@ -48,6 +48,9 @@ Agent_/
    │  ├─ chat_service.py          # 聊天路由决策、后处理、相关性判断
    │  ├─ brain.py                 # DeepSeek 兼容模型调用
    │  ├─ memory.py                # 内存会话与运行态管理
+   │  ├─ core/                    # 编排核心组件（任务执行管理等）
+   │  │  ├─ __init__.py
+   │  │  └─ task_execution_manager.py
    │  └─ __init__.py
    ├─ atr/
    │  ├─ acs.json                 # ACPs 能力描述（注册材料）
@@ -74,24 +77,32 @@ Agent_/
   - 支持 `awaiting-input` 与 `awaiting-completion` 状态。
 - [x] 实现 Leader 代理能力（可主动调用远端 Partner）。
 - [x] 实现 Human 入口（网页 + API），可由用户直接触发本地回复或远端协作。
+- [x] 已接入 ADP 自动发现（Discovery）：
+  - 可基于用户问题自动 discover 候选智能体；
+  - 解析 ACS 并提取可调用 RPC 端点（含 `JSONRPC`/`HTTP_JSON` 兼容处理）。
 - [x] 增加调用可信性防护机制：
   - 任务绑定一致性检查；
   - 调用证据（call proof）校验；
   - 离题响应检测与重试。
-- [x] 完成 Leader/Human 调用链修复（参考 `demo-leader` 完成闸门思路）：
+- [x] 完成 Leader/Human 调用链修复（参考 `demo-leader` 的执行闸门与收敛思路）：
   - 在 `awaiting-completion` 状态下增加自动 `complete` 收尾；
+  - `continue`/`complete` 的边界状态与幂等语义对齐；
   - 新话题默认触发新 task，降低旧 task 结果复用概率；
+  - 增加 `task_id` 级串行处理保护，降低并发写冲突风险；
   - 提升异常可观测性（错误信息与阶段信息更完整）。
 - [x] 超时策略已上调：
   - `LEADER_CALL_TIMEOUT_SECONDS` 默认值已调为 `30`；
   - `HUMAN_TOTAL_BUDGET_SECONDS` 默认值已调为 `30`。
+- [x] Human 前端已优化：
+  - 增加 pending 加载提示与自动轮询；
+  - 避免将远端 `working` 中间态直接当作最终回答输出；
+  - 修复输入区在部分窗口尺寸下被消息区挤压的问题，增强响应式兼容性。
 - [x] 测试体系已具备基础覆盖，当前测试通过。
-- [x] 已准备并提交 ATR 注册材料，进入“审批等待”阶段。
+- [x] 已完成注册与互联联调验证（以当前部署环境与账号权限为准）。
 
 ### 3.2 正在进行
 
-- [ ] 审核状态跟踪与 AIC 下发等待。
-- [ ] 证书申请前配置与部署连通性准备（endpoint、TLS 拓扑一致性）。
+- [ ] 生产化部署细节收敛（endpoint、TLS 拓扑一致性、证书轮换策略）。
 - [ ] Partner 侧深度稳定性治理（并发竞争、回放幂等、会话记忆隔离）与补测。
 
 ### 3.3 下一阶段
@@ -130,8 +141,10 @@ Agent_/
 - 提供 `/human` 网页对话界面。
 - 提供 `/human/chat` API。
 - 可在“本地对话回复”和“经 Leader 调远端 Partner”之间动态路由。
+- 支持自动发现远端智能体（ADP），并在运行信息中展示发现结果与候选信息。
 - 具备会话态维护、错误恢复提示、时延预算控制与后处理逻辑。
 - 对 `awaiting-completion` 场景具备任务收尾和路由纠偏能力，降低“旧回答粘连”。
+- 远端处理中返回 `leader-pending` 并由前端轮询，不再将 `working` 中间态当作最终答案。
 
 ---
 
@@ -143,7 +156,7 @@ Agent_/
 - **ATR（Agent Trusted Registration）**：定义可信注册流程（ACS 审核 + 证书）。
 - **ADP（Agent Discovery Protocol）**：定义如何发现合适智能体。
 
-本项目当前重点落在：**AIP 已落地，ATR 在审核中，ADP 尚未接入主流程**。
+本项目当前重点落在：**AIP 已落地，ADP 已接入并用于 Human/Leader 协作路径，ATR/证书流程已具备实践基础**。
 
 ### 5.2 最小任务状态机（本项目可映射）
 
@@ -209,7 +222,7 @@ pytest -q
   - `partner/atr/acs.json`
   - `partner/atr/acps-cli.toml`
   - 注册与证书脚本
-- 已执行注册提交流程，当前处于 **平台审核等待**。
+- 已执行注册与发现联调流程，具备跨智能体互联验证基础。
 
 ### 7.2 审批前后动作
 
@@ -248,7 +261,7 @@ pytest -q
 
 ### 8.4 互联能力扩展
 
-- 目前尚未接入 ADP 动态发现（仍偏手工指定 RPC 地址）。
+- ADP 已接入，但在 discover 结果不稳定或无可调用端点时，仍可能退化到本地回复，需继续优化重试与缓存策略。
 - Group/MQ 协作模式尚未纳入主链路。
 - 多 Partner 并发编排与结果聚合能力仍在规划阶段。
 
@@ -266,14 +279,14 @@ pytest -q
 阶段1: 单体可运行（已完成）
   Direct RPC + 文本状态机 + 基础测试
 
-阶段2: 可信接入（进行中）
-  ATR审核通过 -> EAB -> 证书 -> TLS/端点对齐
+阶段2: 可信接入（已打通流程，持续收敛）
+  注册/证书流程验证 -> TLS/端点对齐 -> 部署策略固定
 
 阶段3: 稳定化
   持久化会话/任务 + 可观测性 + 错误恢复增强
 
 阶段4: 互联升级
-  Discovery接入 + 多Partner编排 + Group模式
+  Discovery稳态优化 + 多Partner编排 + Group模式
 
 阶段5: 生产化
   安全策略完善 + 自动化部署 + 压测与容量规划

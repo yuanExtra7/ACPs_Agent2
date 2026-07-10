@@ -92,7 +92,7 @@ def main() -> None:
         help="Remote Partner RPC URL",
     )
     parser.add_argument("--leader-id", default="local-leader-acps-test", help="Leader senderId")
-    parser.add_argument("--user-input", default="请简单自我介绍并说明你能做什么。", help="Start input text")
+    parser.add_argument("--user-input", default="1+1=？", help="Start input text")
     parser.add_argument("--continue-input", default="请补充一条更具体的能力说明。", help="Continue input text")
     parser.add_argument("--poll-seconds", type=int, default=1, help="Polling interval when state is working")
     args = parser.parse_args()
